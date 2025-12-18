@@ -95,7 +95,6 @@ class Step(torch.autograd.Function):
         )
         return None, threshold_grad, None
 
-
 class JumpReLU(torch.autograd.Function):
     @staticmethod
     def forward(

@@ -57,7 +57,7 @@ class ActivationsStore:
         self.return_tokens = False 
         self.mix_with_previous_buffer = True
         
-        model.cfg.use_hook_mlp_in = True 
+        model.cfg.use_hook_mlp_in = True # probably should remove
         self.buffer_counter = 0
         if cfg.n_batches_in_buffer < 2 or cfg.n_batches_in_buffer % 2:
             raise ValueError("n_batches_in_buffer must be an even integer ≥ 2")
@@ -73,8 +73,8 @@ class ActivationsStore:
 
         if self.cfg.cached_activations_path is None: 
 
-            if "CausalNLP" in self.cfg.model_name or "meta-llama" in self.cfg.model_name: 
-                self.raw_ds = load_dataset_auto(cfg.dataset_path, split="all").shuffle(seed=42)
+            if self.cfg.is_multilingual_split_dataset: 
+                self.raw_ds = load_dataset_auto(cfg.dataset_path, split="all", is_multilingual_split_dataset=True).shuffle(seed=42)
                 logger.info(f"First sample sequence: {self.raw_ds[0]}")
                 self.doc_languages = [self.raw_ds[i]["language"] for i in range(len(self.raw_ds))]
             else:
@@ -130,7 +130,7 @@ class ActivationsStore:
         Yield each row's token vector as a 1‑D torch.Tensor on **CPU**.
         """
         dataset_len = len(self.raw_ds)
-        if self.cfg.ddp or self.cfg.fsdp:
+        if self.cfg.is_distributed:
             shard_size = dataset_len // self.world_size
             start = self.rank * shard_size
             end = dataset_len if self.rank == self.world_size - 1 else start + shard_size
@@ -151,7 +151,7 @@ class ActivationsStore:
             if truncated_len > 0:
                 toks = toks[:truncated_len]
 
-                if "CausalNLP" in self.cfg.model_name or "meta-llama" in self.cfg.model_name: 
+                if self.cfg.is_multilingual_split_dataset: 
                     n_sequences = truncated_len // (self.context_size)
                     for _ in range(n_sequences):
                         self.runtime_doc_languages.append(self.doc_languages[i])
@@ -283,20 +283,12 @@ class ActivationsStore:
                 if self.return_tokens:
                     all_tokens = new_tokens
                 
-            # Ensures all ranks use the same seed for shuffling the current buffer.
-            if dist.is_initialized() and self.world_size > 1 and not (self.cfg.ddp or self.cfg.fsdp):
-                #  Create a tensor containing the local counter value
-                counter_tensor = torch.tensor(self.buffer_counter, dtype=torch.int64, device=self.device)
-                
-                # Broadcast the counter from Rank 0 to all others 
-                dist.broadcast(counter_tensor, src=0) 
-                
-                # Update the local counter on all ranks with the synchronized value
-                self.buffer_counter = counter_tensor.item()
-                
+            # all ranks use the same seed for shuffling the current buffer.
+            if self.cfg.is_sharded:
+                self._sync_buffer_counter()   
+
             if self.shuffle:
                 g = torch.Generator()
-                # use the now-synchronized counter for the seed
                 g.manual_seed(42 + self.buffer_counter) 
                 
                 perm = torch.randperm(all_in.size(0), generator=g, device="cpu")
@@ -304,11 +296,9 @@ class ActivationsStore:
                 if self.return_tokens:
                     all_tokens = all_tokens[perm]
             
-            # Increment the counter for the next time we rebuild
             self.buffer_counter += 1
 
-            # Synchronize before any distributed operations
-            if dist.is_initialized() and self.world_size > 1:
+            if self.cfg.uses_process_group:
                 dist.barrier()
 
             if self.mix_with_previous_buffer:
@@ -333,6 +323,16 @@ class ActivationsStore:
                 drop_last=True
             )
             self._yield_iter = iter(loader)
+
+    def _sync_buffer_counter(self) -> None:
+        counter = torch.tensor(
+            self.buffer_counter,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        dist.broadcast(counter, src=0)
+        self.buffer_counter = counter.item()
+
     # ───────────────────  normalization  ───────────────────
 
     @torch.no_grad()
@@ -344,28 +344,20 @@ class ActivationsStore:
         self.estimated_norm_scaling_factor_in = torch.ones(self.N_layers, dtype=self.dtype, device="cpu")
         self.estimated_norm_scaling_factor_out = torch.ones(self.N_layers, dtype=self.dtype, device="cpu")
 
-        # 1. All ranks must consume data to ensure synchronization and buffer rebuilding.
-        # The 'disable=(self.rank != 0)' argument makes the progress bar visible only on Rank 0.
         for _ in tqdm(range(n_batches_for_norm_estimate), 
                       desc="Estimating norm scaling factor", 
                       disable=(self.rank != 0)): 
             
-            # All ranks call the iterator to consume the batch. 
-            # This ensures internal buffer rebuild barriers are hit synchronously 
-            # and the data pointer (cache_ptr) is aligned across all GPUs.
+            # cache_ptr is aligned across all GPUs.
             acts_in, acts_out = next(iter(self))
 
-            # 2. Only Rank 0 calculates and stores the norms for averaging.
             if self.rank == 0:
-                # Calculate the mean norm across the batch dimension (B*C) for each layer (N_layers)
                 norms_per_layer_in.append(acts_in.norm(dim=-1).mean(dim=0))
                 norms_per_layer_out.append(acts_out.norm(dim=-1).mean(dim=0))
             
-            # Clean up the memory on all ranks after consumption.
             del acts_in, acts_out
             torch.cuda.empty_cache()
 
-        # 3. Only Rank 0 performs the final calculation after the loop.
         if self.rank == 0:
             mean_norm_per_layer_in = torch.stack(norms_per_layer_in, dim=0).mean(dim=0)
             mean_norm_per_layer_out = torch.stack(norms_per_layer_out, dim=0).mean(dim=0)
@@ -378,68 +370,29 @@ class ActivationsStore:
             logger.info(f"Estimated norm scaling factor in: {self.estimated_norm_scaling_factor_in}")
             logger.info(f"Estimated norm scaling factor out: {self.estimated_norm_scaling_factor_out}")
 
-        return self.estimated_norm_scaling_factor_in, self.estimated_norm_scaling_factor_out
+        return self.estimated_norm_scaling_factor_in, self.estimated_norm_scaling_factor_out    
 
-    # def estimate_norm_scaling_factor(self, n_batches_for_norm_estimate: int = 10):
-        
-    #     norms_per_layer_in = []
-    #     norms_per_layer_out = []
-
-    #     self.estimated_norm_scaling_factor_in = torch.ones(self.N_layers, dtype = self.dtype, device="cpu")
-    #     self.estimated_norm_scaling_factor_out = torch.ones(self.N_layers, dtype = self.dtype, device="cpu")
-
-    #     for _ in tqdm(range(n_batches_for_norm_estimate), desc="Estimating norm scaling factor"):
-    #         if self.return_tokens:
-    #             _, acts_in, acts_out = next(iter(self))
-    #         else: 
-    #             acts_in, acts_out = next(iter(self))
-
-    #         assert acts_in.shape[1] == self.N_layers, \
-    #             f"Expected second dimension to be n_layers ({self.N_layers}), but got {acts_in.shape[1]}"
-            
-    #         norms_per_layer_in.append(acts_in.norm(dim=-1).mean(dim=0))
-    #         norms_per_layer_out.append(acts_out.norm(dim=-1).mean(dim=0))
-
-    #         # at end of loop iteration
-    #         del acts_in, acts_out
-    #         torch.cuda.empty_cache()   # useful to debug; usually not needed in production
-
-    #     mean_norm_per_layer_in = torch.stack(norms_per_layer_in, dim=0).mean(dim=0)
-    #     mean_norm_per_layer_out = torch.stack(norms_per_layer_out, dim=0).mean(dim=0)
-
-    #     logger.info(f"Estimated norm scaling factor in:{(self.cfg.d_in ** 0.5) / mean_norm_per_layer_in}")
-    #     logger.info(f"Estimated norm scaling factor out:{(self.cfg.d_in ** 0.5) / mean_norm_per_layer_out}")
-
-    #     return (self.cfg.d_in ** 0.5) / mean_norm_per_layer_in, (self.cfg.d_in ** 0.5) / mean_norm_per_layer_out
-    
     @torch.no_grad()
     def set_norm_scaling_factor_if_needed(self):
 
         if self.estimated_norm_scaling_factor_in is None or self.estimated_norm_scaling_factor_out is None:
             
-            #ALL ranks call estimate_norm_scaling_factor()
-            # This ensures all ranks consume the same batches, keeping data pointers aligned.
+            # ensures all ranks consume batches (important for feature_sharding to keep same pointer)
             self.estimated_norm_scaling_factor_in, self.estimated_norm_scaling_factor_out = self.estimate_norm_scaling_factor()
             
-            # --- Broadcast the calculated values (from my previous fixes) ---
-            if self.cfg.ddp or self.cfg.fsdp or self.world_size > 1:
-                
-                # Use a barrier to prevent deadlocks before the broadcast
+            if self.cfg.uses_process_group:
                 dist.barrier() 
 
-                # Prepare tensors for broadcast (move to device)
                 tensor_in = self.estimated_norm_scaling_factor_in.to(self.device)
                 tensor_out = self.estimated_norm_scaling_factor_out.to(self.device)
 
                 dist.broadcast(tensor_in, src=0)
                 dist.broadcast(tensor_out, src=0)
 
-                # Update the stored CPU tensors with the broadcasted values
                 self.estimated_norm_scaling_factor_in = tensor_in.cpu()
                 self.estimated_norm_scaling_factor_out = tensor_out.cpu()
 
                 del tensor_in, tensor_out # Clean up device memory
-
 
     def apply_norm_scaling_factor_in(self, activations: torch.Tensor) -> torch.Tensor:
         if self.estimated_norm_scaling_factor_in is None:
@@ -576,14 +529,15 @@ class ActivationsStore:
 
     def _load_cached_activations(self) -> None:
         if not hasattr(self, "split"):
-            # self.split = self.rank 
-            self.split = self.rank if (self.cfg.ddp or self.cfg.fsdp) else 0
+            if not self.cfg.is_sharded: 
+                self.split = self.rank
+            else: 
+                self.split = 0
             
-        print(f"GPU {self.rank} loading split {self.split}")
+        logger.info(f"GPU {self.rank} loading split {self.split}")
         if self.cfg.cached_activations_path is None:
             raise ValueError("cached_activations_path must not be None here")
 
-        # Compose path
         activations_path = activation_split_path(self.cfg.cached_activations_path, self.context_size, self.split)
         
         # If it doesn't exist, restart from 0
@@ -597,15 +551,17 @@ class ActivationsStore:
         # Load
         tensors = load_file(activations_path)
         self.cached_act_in = tensors["act_in"].to(self.dtype).cpu() # was saved on gpu
-        self.cached_act_out = tensors["act_out"].to(self.dtype).cpu() # was saved on gpu
-        self.cached_tokens = tensors["tokens"].cpu() # was saved on gpu
+        self.cached_act_out = tensors["act_out"].to(self.dtype).cpu()
+        self.cached_tokens = tensors["tokens"].cpu()
 
         logger.info(f"[ActivationsStore] Loaded split {self.split} "
                     f"with {self.cached_act_in.shape[0]} samples "
                     f"from {activations_path}")
-
-        # self.split += self.world_size
-        self.split += self.world_size if (self.cfg.ddp or self.cfg.fsdp) else 1
+            
+        if not self.cfg.is_sharded: 
+            self.split += self.world_size
+        else: 
+            self.split += 1
         self.cache_ptr = 0
 
     # ───────────────────  public iterator  ───────────────────
@@ -626,9 +582,9 @@ class ActivationsStore:
             except StopIteration:
                 self._rebuild_buffers()
 
+# TODO: should be more systematic, the split 
 # helps to load dataset either locally or from huggingface
-def load_dataset_auto(path_or_name: str, split="train"):
-    # if os.path.exists(path_or_name):
+def load_dataset_auto(path_or_name: str, split: str = "train", is_multilingual_split_dataset: bool = False):
     if os.path.exists(path_or_name):
         logger.info("Loading from disk")
 
@@ -642,7 +598,7 @@ def load_dataset_auto(path_or_name: str, split="train"):
         )
     else:
         # For the multilingual dataset
-        if split == "all":
+        if is_multilingual_split_dataset:
 
             logger.info(f"Loading dataset {path_or_name}...")
             start_time = time.time()

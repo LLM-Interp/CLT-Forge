@@ -58,10 +58,10 @@ class CLT(nn.Module):
 
         init_device = self.device if not cfg.fsdp else torch.device("cpu")
 
-        if world_size > 1 and not cfg.ddp and not cfg.fsdp:
-            torch.manual_seed(cfg.seed + rank)  # Different seed per rank
+        if self.cfg.is_sharded:
+            torch.manual_seed(cfg.seed + rank) # Different seed per rank
         else:
-            torch.manual_seed(cfg.seed)  # Same seed for DDP/FSDP
+            torch.manual_seed(cfg.seed) # Same seed for DDP/FSDP
 
         self.N_layers_out = torch.tensor(
             [cfg.n_layers - (i + 1) for i in range(self.N_layers)],
@@ -114,7 +114,7 @@ class CLT(nn.Module):
     def _initialize(self) -> None:
         # Anthropic guidelines
         # encoder:  U(-1/n_features,  +1/n_features)
-        enc_lim = 1.0 / self.local_d_latent**0.5
+        enc_lim = 1.0 / self.d_latent**0.5
         for W in self.W_enc:
             nn.init.uniform_(W, -enc_lim, enc_lim)
 
@@ -154,7 +154,7 @@ class CLT(nn.Module):
                     bias_values[layer, feature] = required_bias
             
             self.b_enc.data = bias_values.to(self.device)
-            print(f"Initialized b_enc with target activation rate {target_activation_rate:.6f}", flush=True)
+            logger.info(f"Initialized b_enc with target activation rate {target_activation_rate:.6f}", flush=True)
             
             # # Verify the initialization by computing actual activation rates
             # feat_act, _ = self.encode(x)            
@@ -163,8 +163,6 @@ class CLT(nn.Module):
             
             # print(f"Actual average activation rate: {avg_activation_rate * self.d_latent:.0f}")
             # print(f"Expected ~{self.d_latent * target_activation_rate:.0f} ")
-
-
 
     def encode(
         self,
@@ -213,20 +211,16 @@ class CLT(nn.Module):
         """
 
         if layer is None:
-            # Full decode
             if self.cfg.cross_layer_decoders:
                 B = z.shape[0]
                 z_sel = z.index_select(1, self.l_idx)  # select source layers
 
-                # Compute contributions from W_dec only
                 contrib = torch.einsum('bkd,kdf->bkf', z_sel, self.W_dec)  # [B, N_dec, d_in]
 
-                # Aggregate contributions into target layers
                 out = torch.zeros(B, self.N_layers, self.d_in, dtype=contrib.dtype, device=contrib.device)
                 out = out.index_add(1, self.k_idx, contrib)
 
-                # All-reduce contributions across ranks if using distributed (feature sharding only)
-                if self.world_size > 1 and not (self.cfg.ddp or self.cfg.fsdp):
+                if self.cfg.is_sharded:
                     dist.all_reduce(out, op=dist.ReduceOp.SUM)
                 
                 # ALL ranks add replicated bias locally
@@ -235,11 +229,9 @@ class CLT(nn.Module):
                 out = out + b_contrib
 
             else:
-                # Single-layer decoder
                 out = torch.einsum("bnk,nkd->bnd", z, self.W_dec)  # [B, N_layers, d_in]
                 
-                # All-reduce contributions across ranks if using distributed (feature sharding only)
-                if self.world_size > 1 and not (self.cfg.ddp or self.cfg.fsdp):
+                if self.cfg.is_sharded:
                     dist.all_reduce(out, op=dist.ReduceOp.SUM)
                 
                 # ALL ranks add replicated bias locally
@@ -297,43 +289,49 @@ class CLT(nn.Module):
         feat_act, hidden_pre = self.encode(act_in)
         act_pred = self.decode(feat_act)
 
-        ### MSE loss (Differentiable)
+        ### MSE loss
         mse_loss_tensor = torch.nn.functional.mse_loss(act_out, act_pred, reduction="none")
         mse_loss_accross_layers = mse_loss_tensor.sum(dim=-1).mean(dim=0)
         mse_loss = mse_loss_accross_layers.sum()
 
-        ### L0 regularization - compute locally with full gradient flow
+        ### L0 regularization
         if self.cfg.cross_layer_decoders:
             squared_norms = (self.W_dec**2).sum(dim=2)
             feature_norms_local = torch.sqrt(torch.matmul(self.layer_mask, squared_norms))
         else: 
             feature_norms_local = self.W_dec.norm(dim=2)
         
-        print(f"Rank {self.rank}: feat_act shape = {feat_act.shape}")
-        print(f"Rank {self.rank}: feature_norms_local shape = {feature_norms_local.shape}")
-        print(f"Rank {self.rank}: W_dec shape = {self.W_dec.shape}")
-        print(f"Rank {self.rank}: W_dec requires_grad = {self.W_dec.requires_grad}")
-        print(f"Rank {self.rank}: feature_norms_local requires_grad = {feature_norms_local.requires_grad}")
-        # Compute L0 loss locally - gradients flow to W_dec)
+        logger.info(f"Rank {self.rank}: feat_act shape = {feat_act.shape}")
+        logger.info(f"Rank {self.rank}: feature_norms_local shape = {feature_norms_local.shape}")
+        logger.info(f"Rank {self.rank}: W_dec shape = {self.W_dec.shape}")
+        logger.info(f"Rank {self.rank}: W_dec requires_grad = {self.W_dec.requires_grad}")
+        logger.info(f"Rank {self.rank}: feature_norms_local requires_grad = {feature_norms_local.requires_grad}")
+        
+        # Compute L0 loss local
         weighted_activations = feat_act * feature_norms_local
         tanh_weighted_activations = torch.tanh(C_l0_COEF * weighted_activations)
         l0_loss_accross_layers = l0_coef * tanh_weighted_activations.sum(dim=-1).mean(dim=0)
         l0_loss_local = l0_loss_accross_layers.sum()
         
-        # SUM losses across ranks (per the L_sparsity = λ ∑_ℓ ∑_i formula)
-        if self.world_size > 1 and not (self.cfg.ddp or self.cfg.fsdp):
+        # SUM losses across ranks
+        if self.cfg.is_sharded:
             dist.all_reduce(l0_loss_local, op=dist.ReduceOp.SUM)
         
         l0_loss = l0_loss_local
-        print(f"Rank {self.rank}: W_dec.requires_grad={self.W_dec.requires_grad}, has grad={self.W_dec.grad is not None}")
-        print(f"Rank {self.rank}: L0 loss = {l0_loss.item():.6f}")
-        print(f"Rank {self.rank}: feature_norms has grad = {hasattr(feature_norms_local, 'grad') and feature_norms_local.grad is not None}")
+        logger.info(f"Rank {self.rank}: W_dec.requires_grad={self.W_dec.requires_grad}, has grad={self.W_dec.grad is not None}")
+        logger.info(f"Rank {self.rank}: L0 loss = {l0_loss.item():.6f}")
+        logger.info(f"Rank {self.rank}: feature_norms has grad = {hasattr(feature_norms_local, 'grad') and feature_norms_local.grad is not None}")
+        
         ### Dead feature penalty 
         dead_feature_loss = df_coef * torch.relu(torch.exp(self.log_threshold) - hidden_pre) * feature_norms_local
         dead_feature_loss = dead_feature_loss.sum(dim=-1).mean(dim=0).sum()
 
-        ### Dead feature count
-        with torch.no_grad(): 
+        # SUM losses across ranks
+        if self.cfg.is_sharded:
+            dist.all_reduce(dead_feature_loss, op=dist.ReduceOp.SUM)
+
+        ### Dead feature count local
+        with torch.no_grad():
             firing = feat_act.sum(dim=0) > 0
             self.feature_count += 1
             self.feature_count[firing] = 0
@@ -355,55 +353,56 @@ class CLT(nn.Module):
     def get_dead_features(self) -> torch.Tensor:
         return self.feature_count > self.cfg.dead_feature_window # [N_layers, d_latent]
 
-    def save_model(self, path_str: str, state_dict_: Optional[Dict] = None):
+    def save_model(self, path_str: str, save_cfg: bool = True, rank: Optional[int] = None, state_dict_: Optional[Dict] = None):
         path = Path(path_str)
         path.mkdir(parents=True, exist_ok=True)
         
         state_dict = self.state_dict()
-
+        prefix = f"rank{rank}_" if rank is not None else ""
         # Remove any keys that start with 'model.' (the attached transformer model)
         clt_state_dict = {k: v for k, v in state_dict.items() if not k.startswith('model.')}
 
-        save_file(clt_state_dict, path / CLT_WEIGHTS_FILENAME)
+        weights_path = path / f"{prefix}{CLT_WEIGHTS_FILENAME}"
+        save_file(clt_state_dict, weights_path)
 
-        cfg_dict = self.cfg.to_dict()
-        
-        cfg_path = path / CLT_CFG_FILENAME
-        with open(cfg_path, "w") as f:
-            json.dump(cfg_dict, f)
+        if save_cfg: 
+            cfg_dict = self.cfg.to_dict()
+            cfg_path = path / CLT_CFG_FILENAME
+
+            with open(cfg_path, "w") as f:
+                json.dump(cfg_dict, f)
 
         return cfg_path
     
     @classmethod
-    def load_from_pretrained(cls, path: Union[str, Path], device: str, model_name: Optional[str] = "gpt2") -> "CLT":
+    def load_from_pretrained(cls, path: Union[str, Path], device: str, is_sharded: bool = False, rank: Optional[int] = None, world_size: Optional[int] = None, model_name: Optional[str] = "gpt2") -> "CLT":
         path = Path(path)
+
+        if is_sharded:
+            if rank is None or world_size is None:
+                raise ValueError("Sharded CLT requires rank and world_size")
+            prefix = f"rank{rank}_"
+        else:
+            rank, world_size, prefix = 0, 1, ""
+
         cfg_path = path / CLT_CFG_FILENAME
-        weights_path = path / CLT_WEIGHTS_FILENAME
+        weights_path = path / f"{prefix}{CLT_WEIGHTS_FILENAME}"
 
         with cfg_path.open("r") as f:
             cfg_dict = json.load(f)
 
-        layer_dict = {
-            "gpt2": 12,
-            "short-sparse-gpt2-v2": 12,
-            "roneneldan/TinyStories-33M": 4,
-            "meta-llama/Llama-3.2-1B": 16,
-            "CausalNLP/tinystories-multilingual-20": 4, 
-            "CausalNLP/tinystories-multilingual-50": 4, 
-            "CausalNLP/tinystories-multilingual-70": 4, 
-            "CausalNLP/tinystories-multilingual-90": 4, 
-            "CausalNLP/gpt2-hf_multilingual-90": 12, 
-            "CausalNLP/gpt2-hf_multilingual-70": 12, 
-            "CausalNLP/gpt2-hf_multilingual-50": 12,
-            "CausalNLP/gpt2-hf_multilingual-20": 12,
-            "tiny-stories-1M": 1
-        }
-
-        cfg_dict["n_layers"] = layer_dict[cfg_dict["model_name"]]
         cfg_dict["device"] = device
         cfg = CLTConfig.from_dict(cfg_dict)
 
-        clt = cls(cfg)
+        if is_sharded != cfg.is_sharded:
+            raise ValueError(
+                f"Sharding mismatch when loading CLT checkpoint:\n"
+                f"  argument is_sharded={is_sharded}\n"
+                f"  checkpoint cfg.is_sharded={cfg.is_sharded}\n"
+                f"These must match."
+            )
+ 
+        clt = cls(cfg, rank=rank, world_size=world_size)
         state_dict = load_file(weights_path, device=device)
         state_dict = {k: v for k, v in state_dict.items() if not k.startswith('model.')}
         missing, unexpected = clt.load_state_dict(state_dict, strict=False)
@@ -413,7 +412,7 @@ class CLT(nn.Module):
 
         clt.to(torch.device(device))
         return clt
-            
+
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self):
         self.W_dec.data /= torch.norm(self.W_dec.data, dim=2, keepdim=True)

@@ -24,6 +24,7 @@ class CLTTrainingRunnerConfig(BaseModel):
     model_from_pretrained_kwargs: Optional[Dict[str, Any]] = None
     dataset_path: str = "" # Hugging face path
     is_dataset_tokenized: bool = True
+    is_multilingual_split_dataset: bool = False
 
     # -----CLT parameters---------------------
     from_pretrained_path: str | None = None
@@ -54,6 +55,7 @@ class CLTTrainingRunnerConfig(BaseModel):
     cross_layer_decoders: bool = True
     lr_warm_up_type: str = "cosine"
     use_mixed_precision: bool = True
+    check_activations_across_ranks_are_equal: bool = True
 
     # ------Functional Loss------------------
     functional_loss: Optional[str] = None
@@ -87,6 +89,7 @@ class CLTTrainingRunnerConfig(BaseModel):
     # -----DDP------------------------------
     ddp: bool = False
     fsdp: bool = False
+    feature_sharding: bool = False
     
     model_config = ConfigDict(
         validate_assignment = False, # re-run assigment after field value change
@@ -96,6 +99,14 @@ class CLTTrainingRunnerConfig(BaseModel):
             torch.dtype: str, 
         }
     )
+
+    @model_validator(mode="after")
+    def validate_ddp_fsdp_sharding(cls, cfg: "CLTTrainingRunnerConfig") -> "CLTTrainingRunnerConfig":
+        if int(cfg.ddp) + int(cfg.fsdp) + int(cfg.feature_sharding) > 1: 
+                raise ValueError(
+                    "Only one can be selected between ddp, sfdp, and feature sharding"
+                )
+        return cfg
 
     @model_validator(mode="after")
     def validate_ddp_and_device(cls, cfg: "CLTTrainingRunnerConfig") -> "CLTTrainingRunnerConfig":
@@ -218,3 +229,15 @@ class CLTTrainingRunnerConfig(BaseModel):
     @property
     def total_training_steps(self) -> int:
         return int(self.total_training_tokens // self.train_batch_size_tokens)
+
+    @property
+    def is_distributed(self) -> bool:
+        return self.ddp or self.fsdp
+
+    @property
+    def is_sharded(self) -> bool:
+        return self.feature_sharding # might have more moving forward
+
+    @property
+    def uses_process_group(self) -> bool:
+        return self.is_distributed or self.is_sharded

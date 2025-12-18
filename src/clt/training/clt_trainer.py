@@ -65,28 +65,6 @@ class CLTTrainer():
             cfg.l0_warm_up_steps,
             lr_waiting_steps = cfg.l0_waiting_steps
         )
-
-        # if self.cfg.functional_loss is not None:
-        #     # for mypy
-        #     if (
-        #         cfg.fc_warm_up_type is None or
-        #         cfg.fc_coefficient is None or
-        #         cfg.total_training_steps is None or
-        #         cfg.fc_warm_up_steps is None or
-        #         cfg.fc_waiting_steps is None
-        #     ):
-        #         raise ValueError(
-        #             "All functional loss scheduler parameters (fc_warm_up_type, fc_coefficient, "
-        #             "total_training_steps, fc_warm_up_steps, fc_waiting_steps) must be set when functional_loss is enabled."
-        #         )
-            
-        #     self.fc_scheduler = LearningRateScheduler(
-        #         cfg.fc_warm_up_type,
-        #         cfg.fc_coefficient,
-        #         cfg.total_training_steps,
-        #         cfg.fc_warm_up_steps,
-        #         lr_waiting_steps=cfg.fc_waiting_steps
-        #     )
             
         self.optimizer = Adam(
             self.clt.parameters(),
@@ -105,24 +83,21 @@ class CLTTrainer():
         self.n_tokens: int = 0
         self.monitoring_l0 = None
 
-
     def _initialize_b_enc(self, n_batches: int = 10): 
 
-        # Gather data for all modes
         x = []
         for _ in range(n_batches):
-            # All ranks must call the iterator to consume data synchronously
+            # consume data synchronously
             acts_in, _ = (t.to(self.cfg.device) for t in next(self.activations_store.__iter__()))
             
             with torch.no_grad():
-                if self.cfg.ddp or self.cfg.fsdp:
-                    # Note: Using .module is correct for DDP/FSDP to access the underlying parameters
+                if self.cfg.is_distributed:
                     hidden_pre = torch.einsum("bnd,ndk->bnk", acts_in, self.clt.module.W_enc).detach().to("cpu")
                 else:
-                    # Accessing unsharded self.clt.W_enc is correct for Feature Sharding
                     hidden_pre = torch.einsum("bnd,ndk->bnk", acts_in, self.clt.W_enc).detach().to("cpu")
             
             x.append(hidden_pre)
+
         x = torch.cat(x, dim=0)
                     
         if self.cfg.ddp:
@@ -131,7 +106,7 @@ class CLTTrainer():
                 
             torch.distributed.barrier()
             torch.distributed.broadcast(self.clt.module.b_enc.data, src=0)
-            
+        
         elif self.cfg.fsdp:
             from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -145,27 +120,22 @@ class CLTTrainer():
         else:  
             self.clt._initialize_b_enc(x)
             
-            if self.world_size > 1:
+            if self.cfg.is_sharded:
                 torch.distributed.barrier()
-
-
 
     def _synchronize_feature_sharding_gradients(self):
         """Manually performs all_reduce(AVG) on non-sharded parameters (b_enc, b_dec) in Feature Sharding mode."""
         
-        # Only run in Feature Sharding mode (world_size > 1, ddp=False, fsdp=False)
-        if self.world_size <= 1 or self.cfg.ddp or self.cfg.fsdp:
-            return
+        if not self.cfg.is_sharded:
+            raise ValueError("This function should not be used if feature_sharding is False.")
 
-        # Get references to the non-sharded parameters
         b_enc_param = self.clt.b_enc
         b_dec_param = self.clt.b_dec
         
-        # # 1. Synchronize b_enc gradient (replicated parameter)
         # if b_enc_param.grad is not None:
         #     dist.all_reduce(b_enc_param.grad.data, op=dist.ReduceOp.AVG)
-            
-        # 2. Synchronize b_dec gradient (replicated parameter)
+        
+        # TODO: is it necessary, if so, why ? 
         if b_dec_param.grad is not None:
             dist.all_reduce(b_dec_param.grad.data, op=dist.ReduceOp.AVG)
             
@@ -178,36 +148,17 @@ class CLTTrainer():
             if self.cfg.from_pretrained_path is None:
                 self._initialize_b_enc()
                 
-            print(f"GPU {self.rank} - b_enc mean: {self.clt.b_enc.mean().item():.4f}, b_enc sum: {self.clt.b_enc.sum().item():.4f}")
+            logger.info(f"GPU {self.rank} - b_enc mean: {self.clt.b_enc.mean().item():.4f}, b_enc sum: {self.clt.b_enc.sum().item():.4f}")
             
             while self.n_tokens < self.cfg.total_training_tokens: 
 
-                # get next batch
                 *tokens_part, acts_in, acts_out = (
                     t.to(device=self.cfg.device) 
                     for t in next(self.activations_store.__iter__())
-                )     
+                )
 
-                # In Feature Sharding, all GPUs must process the exact same input batch.
-                if self.world_size > 1:
-                    # We sample the first value of the input activations (acts_in[0, 0, 0]).
-                    local_val = acts_in[0, 0, 0].detach().clone() 
-
-                    # Prepare list to gather values from all ranks
-                    gathered_vals = [torch.zeros_like(local_val) for _ in range(self.world_size)]
-                    
-                    # Use all_gather to collect the reference value from every GPU
-                    dist.all_gather(gathered_vals, local_val)
-
-                    # Compare local value against Rank 0's reference value
-                    ref_val = gathered_vals[0]
-                    if not torch.isclose(local_val, ref_val, rtol=1e-5):
-                        err_msg = (f"CRITICAL DATA DESYNC AT STEP {self.n_training_steps}!\n"
-                                f"Rank {self.rank} input: {local_val.item():.6f}\n"
-                                f"Rank 0 input: {ref_val.item():.6f}\n"
-                                f"The GPUs are processing different data batches. Check ActivationsStore barriers.")
-                        logger.error(err_msg)
-                        raise RuntimeError(err_msg)   
+                if self.cfg.check_activations_across_ranks_are_equal and self.cfg.is_sharded: 
+                    self.check_activations_across_ranks_are_equal()
 
                 loss_metrics = self._compute_training_step_loss(
                     acts_in, 
@@ -253,6 +204,22 @@ class CLTTrainer():
 
             return self.clt
 
+    def check_activations_across_ranks_are_equal(self, acts_in: torch.Tensor): 
+
+        # Use first value to check
+        local_val = acts_in[0, 0, 0].detach().clone() 
+        gathered_vals = [torch.zeros_like(local_val) for _ in range(self.world_size)]
+        dist.all_gather(gathered_vals, local_val)
+
+        ref_val = gathered_vals[0]
+        if not torch.isclose(local_val, ref_val, rtol=1e-5):
+            err_msg = (f"CRITICAL DATA DESYNC AT STEP {self.n_training_steps}!\n"
+                    f"Rank {self.rank} input: {local_val.item():.6f}\n"
+                    f"Rank 0 input: {ref_val.item():.6f}\n"
+                    f"The GPUs are processing different data batches. Check ActivationsStore barriers.")
+            logger.error(err_msg)
+            raise RuntimeError(err_msg)   
+
     def _log_debug_info(self, loss_metrics: LossMetrics):
         """Log activation and gradient norms across GPUs."""
         if self.n_training_steps % 100 != 0:
@@ -260,22 +227,19 @@ class CLTTrainer():
         
         sparsity = (loss_metrics.feature_acts == 0).float().mean().item()
         if self.rank == 0:
-            print(f"Feature sparsity: {sparsity:.4f}")
+            logger.info(f"Feature sparsity: {sparsity:.4f}")
 
-        print(f"Rank {self.rank}: W_dec[0,0,0] = {self.clt.W_dec[0,0,0].item():.6f}")
+        logger.info(f"Rank {self.rank}: W_dec[0,0,0] = {self.clt.W_dec[0,0,0].item():.6f}")
         if self.clt.W_dec.grad is not None:
-            print(f"Rank {self.rank}: W_dec.grad[0,0,0] = {self.clt.W_dec.grad[0,0,0].item():.6f}")
+            logger.info(f"Rank {self.rank}: W_dec.grad[0,0,0] = {self.clt.W_dec.grad[0,0,0].item():.6f}")
         else:
-            print(f"Rank {self.rank}: W_dec.grad is None")
-
+            logger.info(f"Rank {self.rank}: W_dec.grad is None")
 
         feat_act = loss_metrics.feature_acts  # [B, N_layers, local_d_latent]
         
-        # Calculate the SQUARED NORM LOCALLY: ||x||^2_local = sum(x^2)
         local_sq_norm_per_layer = feat_act.pow(2).sum(dim=(0, 2))  # [N_layers]
         
-        if self.world_size > 1:
-            
+        if self.cfg.uses_process_group:
             # Gather the local SQUARED norms from all GPUs.
             all_sq_norms_list = [
                 torch.zeros_like(local_sq_norm_per_layer) 
@@ -283,36 +247,27 @@ class CLTTrainer():
             ]
             dist.all_gather(all_sq_norms_list, local_sq_norm_per_layer.contiguous())
             
-            # Sum the squared norms to get the global squared norm.
             global_sq_norm_per_layer = sum(all_sq_norms_list)
-            
-            # Take the square root to get the global L2 norm
             global_norm_per_layer = torch.sqrt(global_sq_norm_per_layer + 1e-12)
-            
-            # average the global norm across layers to get the final logged metric.
             final_logged_norm = global_norm_per_layer.mean().item()
-            
-            # Set the activation norms for the subsequent gradient logging block
             act_norms_per_layer = global_norm_per_layer
             
             if self.rank == 0:
-                print(f"\nStep {self.n_training_steps}")
-                print(f"Activation norms per GPU (Local Shard Norms):")
-                # Print the local norms 
+                logger.info(f"\nStep {self.n_training_steps}")
+                logger.info(f"Activation norms per GPU (Local Shard Norms):")
                 for gpu_id in range(self.world_size):
-                    # Calculate the L2 norm for the local shard: sqrt(sum(local_sq_norm) / N_layers)
+                    # sqrt(sum(local_sq_norm) / N_layers)
                     local_norm_val = torch.sqrt(all_sq_norms_list[gpu_id].sum() / all_sq_norms_list[gpu_id].size(0) + 1e-12)
-                    print(f"  GPU {gpu_id}: {local_norm_val.item():.4f}")
-                print(f"Global Activation Norm (Synchronized): {final_logged_norm:.4f}")
+                    logger.info(f"  GPU {gpu_id}: {local_norm_val.item():.4f}")
+                logger.info(f"Global Activation Norm (Synchronized): {final_logged_norm:.4f}")
         else:
-            # Single GPU case (original logic)
             act_norms_per_layer = feat_act.norm(dim=(0, 2)).mean(dim=0)  # [N_layers]
             if self.rank == 0:
-                print(f"\nStep {self.n_training_steps}")
-                print(f"Activation norms: {act_norms_per_layer}")
+                logger.info(f"\nStep {self.n_training_steps}")
+                logger.info(f"Activation norms: {act_norms_per_layer}")
         
         # Gradient norms per parameter type
-        if self.cfg.ddp or self.cfg.fsdp:
+        if self.cfg.is_distributed:
             W_enc = self.clt.module.W_enc
             b_enc = self.clt.module.b_enc
             W_dec = self.clt.module.W_dec
@@ -327,25 +282,25 @@ class CLTTrainer():
             "W_dec": W_dec.grad.norm().item() if W_dec.grad is not None else 0.0,
         }
         
-        if self.world_size > 1:
+        if self.cfg.uses_process_group:
 
             grad_norm_tensor = torch.tensor([grad_norms["W_enc"], grad_norms["b_enc"], grad_norms["W_dec"]], device=self.cfg.device)
             all_grad_norms = [torch.zeros_like(grad_norm_tensor) for _ in range(self.world_size)]
             dist.all_gather(all_grad_norms, grad_norm_tensor.contiguous())
             
             if self.rank == 0:
-                print(f"Gradient norms per GPU:")
+                logger.info(f"Gradient norms per GPU:")
                 for gpu_id in range(self.world_size):
                     norms = all_grad_norms[gpu_id]
-                    print(f"  GPU {gpu_id}: W_enc={norms[0]:.4f}, b_enc={norms[1]:.4f}, W_dec={norms[2]:.4f}")
+                    logger.info(f"  GPU {gpu_id}: W_enc={norms[0]:.4f}, b_enc={norms[1]:.4f}, W_dec={norms[2]:.4f}")
         else:
             if self.rank == 0:
-                print(f"Gradient norms: W_enc={grad_norms['W_enc']:.4f}, b_enc={grad_norms['b_enc']:.4f}, W_dec={grad_norms['W_dec']:.4f}")
+                logger.info(f"Gradient norms: W_enc={grad_norms['W_enc']:.4f}, b_enc={grad_norms['b_enc']:.4f}, W_dec={grad_norms['W_dec']:.4f}")
 
     def _compute_training_step_loss(self, act_in: torch.Tensor, act_out: torch.Tensor, tokens: Optional[torch.Tensor] = None) -> LossMetrics:
        
         if self.n_training_steps < 5:
-            print(f"GPU {self.rank} - act_in sum: {act_in.sum().item():.4f}, shape: {act_in.shape}")
+            logger.info(f"GPU {self.rank} - act_in sum: {act_in.sum().item():.4f}, shape: {act_in.shape}")
 
         self.optimizer.zero_grad()
     
@@ -356,8 +311,8 @@ class CLTTrainer():
             loss, loss_metrics = self.clt(act_in, act_out, self.l0_scheduler.get_lr(), df_coef=self.cfg.dead_penalty_coef)
         
         if self.n_training_steps == 0 and self.rank == 0:
-            print(f"feat_act shape: {loss_metrics.feature_acts.shape}", flush=True)
-            print(f"act_pred shape: {loss_metrics.act_pred.shape}", flush=True)
+            logger.info(f"feat_act shape: {loss_metrics.feature_acts.shape}")
+            logger.info(f"act_pred shape: {loss_metrics.act_pred.shape}")
         
         if self.n_training_steps % 100 == 0 and self.world_size > 1:
             loss_tensor = loss_metrics.mse_loss.detach()
@@ -365,15 +320,14 @@ class CLTTrainer():
             dist.all_gather(all_losses, loss_tensor.contiguous())
             if self.rank == 0:
                 loss_str = ", ".join([f"gpu{i}: {l.item():.2f}" for i, l in enumerate(all_losses)])
-                print(f"Step {self.n_training_steps} - {loss_str}", flush=True)
+                logger.info(f"Step {self.n_training_steps} - {loss_str}", flush=True)
         
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.clt.parameters(), 1.0)
             
-            # GRADIENT SYNCHRONIZATION
-            if self.world_size > 1 and not (self.cfg.ddp or self.cfg.fsdp):
+            if self.cfg.is_sharded:
                 self._synchronize_feature_sharding_gradients() 
             
             self.scaler.step(self.optimizer)
@@ -381,8 +335,7 @@ class CLTTrainer():
         else:
             loss.backward()
             
-            # GRADIENT SYNCHRONIZATION
-            if self.world_size > 1 and not (self.cfg.ddp or self.cfg.fsdp):
+            if self.cfg.is_sharded:
                 self._synchronize_feature_sharding_gradients()
                     
             self.optimizer.step()
@@ -417,7 +370,7 @@ class CLTTrainer():
         act_pred = loss_metrics.act_pred
         loss = loss_metrics.mse_loss + loss_metrics.l0_loss # TODO, need to change this
 
-        if self.cfg.ddp or self.cfg.fsdp:
+        if self.cfg.is_distributed:
             dead_features_per_layer = self.clt.module.get_dead_features().sum(dim=1)
         else: 
             dead_features_per_layer = self.clt.get_dead_features().sum(dim=1)
@@ -513,7 +466,7 @@ class CLTTrainer():
         metrics_dict: Dict[str, torch.Tensor],
     ) -> Dict:
         
-        if self.cfg.ddp or self.cfg.fsdp:
+        if self.cfg.is_distributed:
             num_layers = self.clt.module.N_layers
         else: 
             num_layers = self.clt.N_layers

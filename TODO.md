@@ -1,4 +1,8 @@
-- bfloat16 training and gradient clipping, should we just use autocasting ?
-- what to do with the functional loss capability, removed for current version ?
-- fixing memory problems in loading the metrics, see _update_layer_metrics_history
-- remove all prints for logger
+<!-- - change the saving of the feature_sharding  -->
+- clean load_dataset_auto in activations_store
+- fix this:                 logger.info("Loading dataset...")
+                self.raw_ds = load_dataset_auto(cfg.dataset_path, split="train[:250000]")
+                logger.info(f"Loaded dataset")
+, should be a parameter, or in the split name 
+- double check set_norm_scaling_factor_if_needed
+- test and fix _synchronize_feature_sharding_gradients (should not be there, could be a check)
