@@ -1,0 +1,53 @@
+{
+  "builder_name": "parquet",
+  "citation": "",
+  "config_name": "default",
+  "dataset_name": "c4-10k",
+  "dataset_size": 21972139,
+  "description": "",
+  "download_checksums": {
+    "hf://datasets/NeelNanda/c4-10k@bdb17e3672308890562fe8f5ebe5d07bc88d764a/data/train-00000-of-00001-f6f21d3dc6d657fc.parquet": {
+      "num_bytes": 13645542,
+      "checksum": null
+    }
+  },
+  "download_size": 13645542,
+  "features": {
+    "text": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "timestamp": {
+      "dtype": "timestamp[us]",
+      "_type": "Value"
+    },
+    "url": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "tokens": {
+      "feature": {
+        "dtype": "int64",
+        "_type": "Value"
+      },
+      "_type": "Sequence"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 35617681,
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_bytes": 21972139,
+      "num_examples": 10000,
+      "dataset_name": "c4-10k"
+    }
+  },
+  "version": {
+    "version_str": "0.0.0",
+    "major": 0,
+    "minor": 0,
+    "patch": 0
+  }
+}

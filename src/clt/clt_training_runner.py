@@ -35,39 +35,31 @@ class CLTTrainingRunner:
         self.dtype = DTYPE_MAP[cfg.dtype]
         self.ddp = cfg.ddp
         self.fsdp = cfg.fsdp
+        self.feature_sharding = cfg.feature_sharding
         torch.manual_seed(cfg.seed)
-        if self.ddp or self.fsdp:
+
+        if self.cfg.uses_process_group:
             if rank is _missing or world_size is _missing:
-                raise ValueError("DDP is enabled but 'rank' and/or 'world_size' were not provided.")
+                raise ValueError("Parallel computing is enabled but 'rank' and/or 'world_size' were not provided.")
             if not dist.is_initialized():
-                raise RuntimeError("Distributed training requested but process group not initialized.")
+                raise RuntimeError("Parallel computing requested but process group not initialized.")
             self.rank = cast(int, rank)
             self.world_size = cast(int, world_size)
             self.cfg.device = f"cuda:{self.rank}"
         else:
-            # Feature sharding or single GPU
-            if rank is not _missing and world_size is not _missing:
-                # Feature sharding mode
-                if not dist.is_initialized():
-                    raise RuntimeError("Feature sharding requested but process group not initialized.")
-                self.rank = cast(int, rank)
-                self.world_size = cast(int, world_size)
-                self.cfg.device = f"cuda:{self.rank}"
-            else:
-                # Single GPU mode
-                self.rank = 0
-                self.world_size = 1
+            self.rank = 0
+            self.world_size = 1
 
         self.is_main_process = True if self.rank == 0 else False
         self.device = torch.device(self.cfg.device)
 
         # For multlingual models added to transformer-lens
-        if "CausalNLP" in self.cfg.model_name or "meta-llama" in self.cfg.model_name: 
-            print("Adding names to Transformer Lens")
+        if self.cfg.is_multilingual_split_dataset: 
+            logger.info("Adding names to Transformer Lens")
             patch_official_model_names()
             patch_convert_hf_model_config()
 
-        if self.ddp or self.fsdp:
+        if self.cfg.is_distributed:
             self.cfg.train_batch_size_tokens = cfg.train_batch_size_tokens // self.world_size
             self.cfg.total_training_tokens = cfg.total_training_tokens // self.world_size
 
@@ -112,10 +104,14 @@ class CLTTrainingRunner:
 
         if self.cfg.from_pretrained_path is not None:
             self.clt = CLT.load_from_pretrained(
-                self.cfg.from_pretrained_path, self.cfg.device
+                self.cfg.from_pretrained_path,
+                self.cfg.device,
+                is_sharded=self.cfg.is_sharded,
+                rank=self.rank,
+                world_size=self.world_size,
             )
-            self.clt = self.clt.to(self.device) # could be on device from previous run
-        else: 
+            self.clt = self.clt.to(self.device)
+        else:
             self.clt = CLT(
                 cfg.create_sub_config(
                     CLTConfig,
@@ -159,11 +155,11 @@ class CLTTrainingRunner:
             )
   
         if self.is_main_process:
-            print(f"Norm scaling in: {self.clt.estimated_norm_scaling_factor_in if hasattr(self.clt, 'estimated_norm_scaling_factor_in') else 'N/A'}")
-            print(f"l0_coefficient: {self.cfg.l0_coefficient}")
-            print(f"l0_warm_up_steps: {self.cfg.l0_warm_up_steps}")
-            print(f"lr: {self.cfg.lr}")
-            print(f"dead_penalty_coef: {self.cfg.dead_penalty_coef}")
+            logger.info(f"Norm scaling in: {self.clt.estimated_norm_scaling_factor_in if hasattr(self.clt, 'estimated_norm_scaling_factor_in') else 'N/A'}")
+            logger.info(f"l0_coefficient: {self.cfg.l0_coefficient}")
+            logger.info(f"l0_warm_up_steps: {self.cfg.l0_warm_up_steps}")
+            logger.info(f"lr: {self.cfg.lr}")
+            logger.info(f"dead_penalty_coef: {self.cfg.dead_penalty_coef}")
 
         trainer = CLTTrainer(
             clt=self.clt,
@@ -180,87 +176,57 @@ class CLTTrainingRunner:
             wandb.finish()
 
         return clt
-    
-    def save_checkpoint(self, trainer: CLTTrainer, checkpoint_name: str) -> None: 
-        """
-        Saves the model state. Uses centralized saving for DDP/FSDP (if Rank 0 has memory) 
-        and switches to OOM-safe decentralized saving for Feature Sharding/Single GPU.
-        """
 
 
+    def save_checkpoint(self, trainer: CLTTrainer, checkpoint_name: str) -> None:
         base_path = Path(trainer.cfg.checkpoint_path) / checkpoint_name
-        
-        # 1. Handle DDP/FSDP
-        if self.fsdp or self.ddp:
-            if self.is_main_process:
-                base_path.mkdir(exist_ok=True, parents=True)
-                
-            dist.barrier() # Ensure directory is created before FSDP/DDP proceed
 
+        if self.rank == 0:
+            base_path.mkdir(exist_ok=True, parents=True)
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+
+        def _unwrap_clt(m):
+            return m.module if hasattr(m, "module") else m
+
+        clt_obj = _unwrap_clt(trainer.clt)
+
+        if self.cfg.is_sharded:
+            # Each rank writes rank{r}_weights.safetensors
+            clt_obj.save_model(str(base_path), save_cfg=(self.rank == 0), rank=self.rank)
+
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+            if self.rank == 0:
+                logger.info(f"Saved sharded checkpoint with {self.world_size} shards to {base_path}")
+            return
+
+        if self.rank == 0:
             if self.fsdp:
                 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
                 from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 
-                # Wrap FSDP for state_dict
                 with FSDP.state_dict_type(
                     trainer.clt,
                     StateDictType.FULL_STATE_DICT,
                     FullStateDictConfig(offload_to_cpu=True),
                 ):
-                    if self.is_main_process:
-                        trainer.clt.module.save_model(str(base_path))
+                    # In this context, trainer.clt.state_dict() is full; your save_model uses self.state_dict()
+                    clt_obj.save_model(str(base_path), save_cfg=True, rank=None)
+
             elif self.ddp:
-                # Just unwrap and save
-                if self.is_main_process:
-                    trainer.clt.module.save_model(str(base_path))
+                clt_obj.save_model(str(base_path), save_cfg=True, rank=None)
+
             else:
-                # Fallback for single GPU if somehow DDP/FSDP is False
-                if self.is_main_process:
-                    trainer.clt.save_model(str(base_path))
-            
-        # 2. Handle Feature Sharding / Single GPU (OOM-Safe Decentralized Save)
-        else:
-            if self.rank == 0:
-                base_path.mkdir(exist_ok=True, parents=True)
-                print(f"Saving sharded checkpoint to directory: {base_path}")
-            
-            # Wait for Rank 0 to create the directory
-            dist.barrier() 
+                # single GPU
+                clt_obj.save_model(str(base_path), save_cfg=True, rank=None)
 
-            # A. Save Model Parameter Shards (All Ranks)
-            local_model_state = {
-                'W_enc': trainer.clt.W_enc.detach().cpu(), 
-                'W_dec': trainer.clt.W_dec.detach().cpu(),
-                'b_enc': trainer.clt.b_enc.detach().cpu(),
-                'b_dec': trainer.clt.b_dec.detach().cpu(),
-            }
-            shard_filename = base_path / f"model_shard_{self.rank}.pt"
-            torch.save(local_model_state, str(shard_filename))
-
-            #  B. Save Optimizer State Shards (All Ranks) 
-            opt_filename = base_path / f"optimizer_shard_{self.rank}.pt"
-            torch.save(trainer.optimizer.state_dict(), str(opt_filename))
-
-            #  C. Save Global Metadata (Rank 0 Only) 
-            if self.rank == 0:
-                global_state = {
-                    'config': trainer.cfg,
-                    'steps': trainer.n_training_steps,
-                    'world_size': self.world_size,
-                    'sharding_dim_W_enc': 1, 
-                    'sharding_dim_W_dec': 0, 
-                }
-                global_filename = base_path / "global_metadata.pt"
-                torch.save(global_state, str(global_filename))
-            
+        if dist.is_available() and dist.is_initialized():
             dist.barrier()
-            if self.rank == 0:
-                print(f"Completed saving {self.world_size} model and optimizer shards.")
-
 
     def update_clt_norm_scaling_factor(self): 
         """ update the CLTs norm scaling factor from the activation store"""
-        if self.fsdp or self.ddp: 
+        if self.cfg.is_distributed: 
             self.clt.module.estimated_norm_scaling_factor_in = self.activations_store.estimated_norm_scaling_factor_in.to(self.device)
             self.clt.module.estimated_norm_scaling_factor_out = self.activations_store.estimated_norm_scaling_factor_out.to(self.device)
         else: 

@@ -31,6 +31,7 @@ class CLTConfig(BaseModel):
     # -----DDP--------------------------------
     ddp: bool = False
     fsdp: bool = False
+    feature_sharding: bool = False
 
     # one‑liner to get a json‑safe dict
     def to_dict(self, *, exclude_none: bool = True,**kw) -> Dict[str, Any]:
@@ -42,3 +43,15 @@ class CLTConfig(BaseModel):
         counterpart to `to_dict` – parses dtype string back to torch.dtype
         """
         return cls.model_validate(cfg_dict)
+
+    @property
+    def is_distributed(self) -> bool:
+        return self.ddp or self.fsdp
+
+    @property
+    def is_sharded(self) -> bool:
+        return self.feature_sharding
+
+    @property
+    def uses_process_group(self) -> bool:
+        return self.is_distributed or self.is_sharded
