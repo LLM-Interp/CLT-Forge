@@ -395,7 +395,7 @@ class CLTTrainer():
         if self.n_training_steps < 5:
             print(f"GPU {self.rank} - act_in sum: {act_in.sum().item():.4f}, shape: {act_in.shape}")
 
-        accumulation_steps = self.cfg.gradient_accumulation_steps
+        accumulation_steps = self.cfg.gradient_accumulation_steps #grad-accum
         
         # Only zero grad at the start or after optimizer step
         if self.n_training_steps % accumulation_steps == 0:

@@ -44,7 +44,7 @@ class CLTTrainingRunnerConfig(BaseModel):
     # -----Training/Optimization--------------
     total_training_tokens: int = 100_000_000
     train_batch_size_tokens: int = 4096
-    gradient_accumulation_steps: int = 1
+    gradient_accumulation_steps: int = 1 #gradient accumulation
     adam_beta1: float = 0.0
     adam_beta2: float = 0.999
     lr: float = 1e-5
