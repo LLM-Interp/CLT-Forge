@@ -525,7 +525,7 @@ class ActivationsStore:
                 save_file({"act_in": acts_in, "act_out": acts_out, "tokens": tokens}, split_path)
                 logger.info(f"[ActivationsStore] Saved split {split_idx + 1}/{split_count} to {split_path}")
             
-                    logger.info(f"[ActivationsStore] Finished saving all {split_count} splits to {save_path}")
+        logger.info(f"[ActivationsStore] Finished saving all {split_count} splits to {save_path}")
 
     def _load_buffer_from_cached(self, return_tokens:bool = False) -> tuple[torch.Tensor, ...]:
         
