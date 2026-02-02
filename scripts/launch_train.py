@@ -15,7 +15,7 @@ from clt.clt_training_runner import CLTTrainingRunner
 import wandb
 
 def main():
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ: # catch interactive jobs and torchrun on local servers
+    if "RANK" in os.environ and "WORLD_SIZE" in os.environ: # catch srun and torchrun on local servers
         print(f"Detected distributed launch via torchrun (Local Rank: {os.environ.get('LOCAL_RANK')})")
         rank = int(os.environ["RANK"])
         world_size = int(os.environ["WORLD_SIZE"])
@@ -27,9 +27,7 @@ def main():
         local_rank = int(os.environ["SLURM_LOCALID"])
     else: # catch single-process launch
         print("Running in single-process mode")
-        rank = 0
-        world_size = 1
-        local_rank = 0
+        rank, world_size, local_rank = 0, 1, 0
     print(f"[Rank {rank}] Initialized on GPU {local_rank} (World Size: {world_size})")
     
     torch.cuda.set_device(local_rank)
@@ -66,7 +64,6 @@ def main():
     # Get absolute path to data directory
 
     cfg = CLTTrainingRunnerConfig(
-        # device=f"cuda:{local_rank}",
         device="cuda", 
         dtype="float32",
         seed=42,
@@ -106,6 +103,7 @@ def main():
         wandb_entity=None,
         fsdp=False,
         ddp=True,
+        feature_sharding=False,
         functional_loss=functional_loss,
         fc_coefficient=fc_coefficient,
         fc_warm_up_steps=fc_warm_up_steps,
