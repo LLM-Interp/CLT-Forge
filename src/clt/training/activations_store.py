@@ -444,16 +444,16 @@ class ActivationsStore:
                 CompressionConfig,
                 CompressedActivationsStore,
             )
-        
-        if compression_config is None:
-            compression_config = CompressionConfig(
-                quantization="int8",
-                compression="zstd",
-                compression_level=3,
-            )
-        
-        compression_store = CompressedActivationsStore(compression_config)
-        logger.info(f"[ActivationsStore] Using compression: {compression_config.quantization} + {compression_config.compression}")
+
+            if compression_config is None:
+                compression_config = CompressionConfig(
+                    quantization="int8",
+                    compression="zstd",
+                    compression_level=3,
+                )
+
+            compression_store = CompressedActivationsStore(compression_config)
+            logger.info(f"[ActivationsStore] Using compression: {compression_config.quantization} + {compression_config.compression}")
         # Set default value for split_end_idx
         if split_end_idx is None:
             split_end_idx = split_count
