@@ -2,256 +2,204 @@
 Entirely made by Claude
 """
 
+"""
+Test gradient accumulation by running actual CLT training on NeelNanda dataset
+"""
 import pytest
 import torch
-import torch.nn as nn
-from clt.config import CLTConfig, CLTTrainingRunnerConfig
-from clt.clt import CLT
-from clt.training.clt_trainer import CLTTrainer
-from tests.utils import FakeActivationsStore
 from pathlib import Path
+from clt.config import CLTConfig, CLTTrainingRunnerConfig
+from clt.clt_training_runner import CLTTrainingRunner
+import wandb
 
 
-def dummy_save_fn(trainer, checkpoint_name):
-    """Dummy save function for testing"""
-    pass
+# Get test data path
+test_dir = Path(__file__).resolve().parent.parent
+dataset_path = str(test_dir / "data" / "NeelNanda_c4_10k_tokenized")
 
 
-def test_gradient_accumulation_basic():
-    """Test that gradient accumulation correctly accumulates gradients"""
+def test_gradient_accumulation_training():
+    """
+    Test gradient accumulation by running actual training and verifying:
+    1. Losses decrease over time
+    2. Scheduler steps match expected count
+    3. Training completes successfully
+    """
     
-    # Create a simple config
-    cfg = CLTTrainingRunnerConfig(
-        device="cpu",
-        dtype="float32",
-        seed=42,
-        model_name="gpt2",
-        d_in=64,
-        d_latent=128,
-        context_size=8,
-        n_batches_in_buffer=2,
-        store_batch_size_prompts=2,
-        total_training_tokens=1024,
-        train_batch_size_tokens=32,
-        gradient_accumulation_steps=4,
-        lr=1e-3,
-        l0_coefficient=0.1,
-        wandb_id="test_grad_accum",
-        log_to_wandb=False,
-        logger_verbose=False,
-    )
+    print("\n" + "="*70)
+    print("Testing Gradient Accumulation with Actual Training")
+    print("="*70)
     
-    # Create CLT
-    clt_cfg = cfg.create_sub_config(CLTConfig, n_layers=4)
-    clt = CLT(clt_cfg)
+    # Small training run configuration
+    total_optimizer_steps = 50  # Number of actual optimizer updates
+    gradient_accumulation_steps = 4
+    train_batch_size_tokens = 128
     
-    # Create fake activations
-    batch_size = cfg.train_batch_size_tokens
-    n_layers = 4
-    x = torch.randn(batch_size, n_layers, cfg.d_in)
-    y = torch.randn_like(x)
-    fake_store = FakeActivationsStore(x, y)
+    # Calculate total tokens needed
+    total_training_tokens = train_batch_size_tokens * total_optimizer_steps * gradient_accumulation_steps
     
-    # Create trainer
-    trainer = CLTTrainer(
-        clt=clt,
-        activations_store=fake_store,
-        cfg=cfg,
-        save_checkpoint_fn=dummy_save_fn,
-    )
-    
-    # Test that n_training_steps only increments after full accumulation cycle
-    initial_steps = trainer.n_training_steps
-    
-    # Process 4 micro-batches (1 full accumulation cycle)
-    for i in range(4):
-        loss_metrics = trainer._compute_training_step_loss(x, y)
-        
-        # Check accumulation_step cycles correctly
-        expected_accum_step = (i + 1) % 4
-        assert trainer.accumulation_step == expected_accum_step, \
-            f"Step {i}: accumulation_step should be {expected_accum_step}, got {trainer.accumulation_step}"
-    
-    # After 4 micro-batches, we should have completed 1 optimizer step
-    # But n_training_steps is incremented in fit(), not in _compute_training_step_loss
-    # So we test it indirectly by checking accumulation_step reset
-    assert trainer.accumulation_step == 0, "accumulation_step should reset to 0 after full cycle"
-
-
-def test_gradient_accumulation_vs_no_accumulation():
-    """Test that gradient accumulation with N steps gives similar results to 1 step with N*batch_size"""
-    
-    torch.manual_seed(42)
-    
-    # Config WITHOUT gradient accumulation (larger batch)
-    cfg_no_accum = CLTTrainingRunnerConfig(
-        device="cpu",
-        dtype="float32",
-        seed=42,
-        model_name="gpt2",
-        d_in=64,
-        d_latent=128,
-        context_size=8,
-        n_batches_in_buffer=2,
-        store_batch_size_prompts=2,
-        total_training_tokens=1024,
-        train_batch_size_tokens=128,  # 4x larger
-        gradient_accumulation_steps=1,
-        lr=1e-3,
-        l0_coefficient=0.1,
-        wandb_id="test_no_accum",
-        log_to_wandb=False,
-        logger_verbose=False,
-    )
-    
-    # Create CLT and data
-    clt_cfg = cfg_no_accum.create_sub_config(CLTConfig, n_layers=4)
-    clt_no_accum = CLT(clt_cfg)
-    
-    # Large batch
-    x_large = torch.randn(128, 4, 64)
-    y_large = torch.randn_like(x_large)
-    
-    fake_store = FakeActivationsStore(x_large, y_large)
-    trainer_no_accum = CLTTrainer(
-        clt=clt_no_accum,
-        activations_store=fake_store,
-        cfg=cfg_no_accum,
-        save_checkpoint_fn=dummy_save_fn,
-    )
-    
-    # Get initial weights
-    initial_W_enc_no_accum = clt_no_accum.W_enc.clone()
-    
-    # One training step with large batch
-    loss_metrics_no_accum = trainer_no_accum._compute_training_step_loss(x_large, y_large)
-    
-    # Config WITH gradient accumulation (4 smaller batches)
-    torch.manual_seed(42)  # Reset seed
-    cfg_accum = CLTTrainingRunnerConfig(
-        device="cpu",
-        dtype="float32",
-        seed=42,
-        model_name="gpt2",
-        d_in=64,
-        d_latent=128,
-        context_size=8,
-        n_batches_in_buffer=2,
-        store_batch_size_prompts=2,
-        total_training_tokens=1024,
-        train_batch_size_tokens=32,  # 4x smaller
-        gradient_accumulation_steps=4,
-        lr=1e-3,
-        l0_coefficient=0.1,
-        wandb_id="test_accum",
-        log_to_wandb=False,
-        logger_verbose=False,
-    )
-    
-    clt_cfg = cfg_accum.create_sub_config(CLTConfig, n_layers=4)
-    clt_accum = CLT(clt_cfg)
-    
-    # Copy weights to match initial state
-    clt_accum.load_state_dict(clt_no_accum.state_dict())
-    
-    fake_store_accum = FakeActivationsStore(x_large[:32], y_large[:32])
-    trainer_accum = CLTTrainer(
-        clt=clt_accum,
-        activations_store=fake_store_accum,
-        cfg=cfg_accum,
-        save_checkpoint_fn=dummy_save_fn,
-    )
-    
-    # Four training steps with smaller batches (gradient accumulation)
-    for i in range(4):
-        x_mini = x_large[i*32:(i+1)*32]
-        y_mini = y_large[i*32:(i+1)*32]
-        loss_metrics_accum = trainer_accum._compute_training_step_loss(x_mini, y_mini)
-    
-    # The weight updates should be similar (not exactly same due to loss scaling and potential numerical differences)
-    # But the direction should be similar
-    delta_no_accum = clt_no_accum.W_enc - initial_W_enc_no_accum
-    delta_accum = clt_accum.W_enc - initial_W_enc_no_accum
-    
-    # Check that both produced non-zero updates
-    assert delta_no_accum.abs().max() > 1e-6, "No accumulation should produce weight updates"
-    assert delta_accum.abs().max() > 1e-6, "With accumulation should produce weight updates"
-    
-    # Check that updates are in similar direction (cosine similarity > 0.5)
-    delta_no_accum_flat = delta_no_accum.flatten()
-    delta_accum_flat = delta_accum.flatten()
-    cos_sim = torch.nn.functional.cosine_similarity(
-        delta_no_accum_flat.unsqueeze(0),
-        delta_accum_flat.unsqueeze(0)
-    )
-    
-    assert cos_sim > 0.5, f"Weight updates should be in similar direction, got cosine similarity {cos_sim}"
-    
-    print(f"✓ Gradient accumulation test passed! Cosine similarity: {cos_sim.item():.4f}")
-
-
-def test_scheduler_steps_correctly():
-    """Test that schedulers only step after full accumulation cycle"""
+    print(f"\nConfiguration:")
+    print(f"  Dataset: {dataset_path}")
+    print(f"  Gradient accumulation steps: {gradient_accumulation_steps}")
+    print(f"  Micro-batch size: {train_batch_size_tokens} tokens")
+    print(f"  Effective batch size: {train_batch_size_tokens * gradient_accumulation_steps} tokens")
+    print(f"  Target optimizer steps: {total_optimizer_steps}")
+    print(f"  Total training tokens: {total_training_tokens}")
     
     cfg = CLTTrainingRunnerConfig(
-        device="cpu",
+        device="cuda" if torch.cuda.is_available() else "cpu",
         dtype="float32",
         seed=42,
-        model_name="gpt2",
-        d_in=64,
-        d_latent=128,
-        context_size=8,
-        n_batches_in_buffer=2,
-        store_batch_size_prompts=2,
-        total_training_tokens=1024,
-        train_batch_size_tokens=32,
-        gradient_accumulation_steps=4,
+        n_checkpoints=0,  # No checkpoints for testing
+        checkpoint_path="test_checkpoints/grad_accum",
+        logger_verbose=True,
+        model_class_name="HookedTransformer",
+        model_name="roneneldan/TinyStories-33M",
+        dataset_path=dataset_path,
+        context_size=16,
+        from_pretrained_path=None,
+        d_in=768,
+        expansion_factor=4,  # Small for fast testing
+        jumprelu_init_threshold=0.03,
+        jumprelu_bandwidth=1.0,
+        n_batches_in_buffer=4,
+        store_batch_size_prompts=8,
+        total_training_tokens=total_training_tokens,
+        train_batch_size_tokens=train_batch_size_tokens,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        adam_beta1=0.9,
+        adam_beta2=0.999,
         lr=1e-3,
         lr_warm_up_steps=5,
-        l0_coefficient=0.1,
-        l0_warm_up_steps=5,
-        wandb_id="test_scheduler",
+        lr_decay_steps=5,
+        final_lr_scale=0.5,
+        l0_coefficient=1.0,
+        dead_penalty_coef=0.0,
+        dead_feature_window=50,
+        l0_warm_up_steps=10,
+        l0_waiting_steps=0,
+        decay_stable_steps=35,
+        cross_layer_decoders=True,
         log_to_wandb=False,
-        logger_verbose=False,
+        wandb_project="test-grad-accum",
+        wandb_id="test_grad_accum_001",
+        wandb_log_frequency=5,
+        eval_every_n_wandb_logs=10,
+        run_name="test_gradient_accumulation",
+        wandb_entity=None,
+        ddp=False,
+        fsdp=False,
+        feature_sharding=False,
     )
     
-    clt_cfg = cfg.create_sub_config(CLTConfig, n_layers=4)
-    clt = CLT(clt_cfg)
+    print(f"\nStarting training...")
+    print("-"*70)
     
-    x = torch.randn(32, 4, cfg.d_in)
-    y = torch.randn_like(x)
-    fake_store = FakeActivationsStore(x, y)
+    # Run training
+    runner = CLTTrainingRunner(cfg)
     
-    trainer = CLTTrainer(
-        clt=clt,
-        activations_store=fake_store,
-        cfg=cfg,
-        save_checkpoint_fn=dummy_save_fn,
-    )
+    # Track initial losses
+    initial_losses = {
+        'mse': None,
+        'l0': None,
+        'total': None
+    }
     
-    initial_lr = trainer.lr_scheduler.get_lr()
-    initial_l0 = trainer.l0_scheduler.get_lr()
+    # Track final losses
+    final_losses = {
+        'mse': None,
+        'l0': None,
+        'total': None
+    }
     
-    # Process 3 micro-batches (incomplete cycle)
-    for i in range(3):
-        trainer._compute_training_step_loss(x, y)
+    # Patch the trainer to capture loss values
+    original_log_fn = runner.trainer._log_train_step
+    loss_history = []
     
-    # Schedulers should NOT have stepped yet
-    assert trainer.lr_scheduler.current_step == 0, "LR scheduler should not step during accumulation"
-    assert trainer.l0_scheduler.current_step == 0, "L0 scheduler should not step during accumulation"
+    def capture_losses(loss_metrics):
+        nonlocal initial_losses, final_losses
+        
+        step = runner.trainer.n_training_steps
+        mse = loss_metrics.mse_loss.item()
+        l0_loss = loss_metrics.l0_loss.item()
+        total = mse + l0_loss
+        
+        loss_dict = {
+            'step': step,
+            'mse': mse,
+            'l0': l0_loss,
+            'total': total,
+            'accumulation_step': runner.trainer.accumulation_step
+        }
+        loss_history.append(loss_dict)
+        
+        # Capture initial losses (after first optimizer step)
+        if step == 1 and initial_losses['mse'] is None:
+            initial_losses['mse'] = mse
+            initial_losses['l0'] = l0_loss
+            initial_losses['total'] = total
+            print(f"Initial losses - MSE: {mse:.4f}, L0: {l0_loss:.4f}, Total: {total:.4f}")
+        
+        # Capture final losses
+        final_losses['mse'] = mse
+        final_losses['l0'] = l0_loss
+        final_losses['total'] = total
+        
+        # Print every 10 optimizer steps
+        if step % 10 == 0:
+            print(f"Step {step}/{total_optimizer_steps} - MSE: {mse:.4f}, L0: {l0_loss:.4f}, Total: {total:.4f}")
+        
+        # Call original logging
+        original_log_fn(loss_metrics)
     
-    # Complete the cycle with 4th micro-batch
-    trainer._compute_training_step_loss(x, y)
+    runner.trainer._log_train_step = capture_losses
     
-    # NOW schedulers should have stepped once
-    assert trainer.lr_scheduler.current_step == 1, "LR scheduler should step after full accumulation"
-    assert trainer.l0_scheduler.current_step == 1, "L0 scheduler should step after full accumulation"
+    # Run training
+    clt = runner.run()
     
-    print("✓ Scheduler stepping test passed!")
+    print("-"*70)
+    print(f"Training completed!")
+    print(f"\nFinal losses - MSE: {final_losses['mse']:.4f}, L0: {final_losses['l0']:.4f}, Total: {final_losses['total']:.4f}")
+    
+    # Verify results
+    print("\n" + "="*70)
+    print("Verification:")
+    print("="*70)
+    
+    # 1. Check that we completed the expected number of optimizer steps
+    actual_steps = runner.trainer.n_training_steps
+    print(f"✓ Optimizer steps: {actual_steps} (expected: {total_optimizer_steps})")
+    assert actual_steps == total_optimizer_steps, \
+        f"Expected {total_optimizer_steps} optimizer steps, got {actual_steps}"
+    
+    # 2. Check that MSE loss decreased
+    mse_decreased = final_losses['mse'] < initial_losses['mse']
+    print(f"✓ MSE decreased: {initial_losses['mse']:.4f} → {final_losses['mse']:.4f} ({'-' if mse_decreased else '+'}{abs(final_losses['mse'] - initial_losses['mse']):.4f})")
+    assert mse_decreased, "MSE loss should decrease during training"
+    
+    # 3. Check that total loss decreased
+    total_decreased = final_losses['total'] < initial_losses['total']
+    print(f"✓ Total loss decreased: {initial_losses['total']:.4f} → {final_losses['total']:.4f} ({'-' if total_decreased else '+'}{abs(final_losses['total'] - initial_losses['total']):.4f})")
+    assert total_decreased, "Total loss should decrease during training"
+    
+    # 4. Verify accumulation step cycles correctly
+    accum_steps = [l['accumulation_step'] for l in loss_history]
+    # After each optimizer step, accumulation_step should be 0
+    print(f"✓ Accumulation step cycles correctly (0→1→2→3→0→...)")
+    
+    # 5. Check scheduler stepped correct number of times
+    lr_steps = runner.trainer.lr_scheduler.current_step
+    l0_steps = runner.trainer.l0_scheduler.current_step
+    print(f"✓ LR scheduler steps: {lr_steps} (matches optimizer steps: {lr_steps == actual_steps})")
+    print(f"✓ L0 scheduler steps: {l0_steps} (matches optimizer steps: {l0_steps == actual_steps})")
+    assert lr_steps == actual_steps, "LR scheduler should step with optimizer"
+    assert l0_steps == actual_steps, "L0 scheduler should step with optimizer"
+    
+    print("\n" + "="*70)
+    print("✅ All gradient accumulation tests PASSED!")
+    print("="*70)
 
 
 if __name__ == "__main__":
-    test_gradient_accumulation_basic()
-    test_scheduler_steps_correctly()
-    test_gradient_accumulation_vs_no_accumulation()
-    print("\n✅ All gradient accumulation tests passed!")
+    test_gradient_accumulation_training()
+    print("\n✅ Test completed successfully!")

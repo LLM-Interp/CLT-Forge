@@ -587,8 +587,10 @@ class ActivationsStore:
 def load_dataset_auto(path_or_name: str, split: str = "train", is_multilingual_split_dataset: bool = False):
     if os.path.exists(path_or_name):
         logger.info("Loading from disk")
-
-        # return load_from_disk(path_or_name)
+        
+        # Check if it's a dataset saved with save_to_disk
+        if Path(path_or_name, "state.json").exists():
+            return load_from_disk(path_or_name)
 
         return load_dataset(
             path_or_name,
