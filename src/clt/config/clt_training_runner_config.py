@@ -72,8 +72,8 @@ class CLTTrainingRunnerConfig(BaseModel):
     l0_waiting_steps: int = 0
     l0_warm_up_type: str = "linear"
     dead_penalty_coef: float =  7.5 * 1e-8
-    optimal_l0: Optional[float] = None
-    checkpoint_l0: Optional[list[int]] = None
+    optimal_l0: Optional[float] = None # when to stop training
+    checkpoint_l0: Optional[list[int]] = None # at which l0 to save
 
     # -----Metrics----------------------------
     dead_feature_window: int = 250

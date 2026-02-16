@@ -1,3 +1,4 @@
+## No personal stuff in there, should be in .git/info/exclude
 # ruff
 .ruff_cache
 
@@ -16,7 +17,7 @@ logs/
 **/logs/
 
 # test 
-tests/ckpts_ddp/
+tests/data
 
 # cache
 cache/ 
@@ -36,6 +37,12 @@ CLAUDE.md
 # data
 data/
 
-# submission files
-interactive_gpu.sub
-**/interactive_gpu.sub
+# Byte-compiled 
+__pycache__/
+
+# Distribution
+.Python
+eggs/
+.eggs/
+*.egg-info/
+*.egg
