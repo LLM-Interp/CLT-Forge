@@ -28,7 +28,7 @@ We also plan to release (March 2026):
 - An automatic interpretability pipeline  
 - A visual interface for exploring features and attribution graphs  
   - Similar in spirit (but simpler) to [Neuronpedia](https://github.com/hijohnnylin/neuronpedia)
-  - Including attention attribution support (as in [SparseAttention]https://arxiv.org/abs/2512.05865)
+  - Including attention attribution support (as in [SparseAttention](https://arxiv.org/abs/2512.05865))
 
 ## Quick Start
 
