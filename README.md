@@ -7,28 +7,26 @@
 [![Poetry](https://img.shields.io/badge/packaging-poetry-cyan)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**CLT** is a Python library for training Cross-Layer Transcoders (CLTs) at scale.
-
-We believe that a major limitation in the development of CLTs, and more broadly attribution graph methods, is the significant engineering effort required to train, analyze, and iterate on them. This library aims to reduce that overhead by providing a clean, scalable, and extensible framework.
+**CLT** is a Python library for training Cross-Layer Transcoders (CLTs) at scale. We believe that a major limitation in the development of CLTs, and more broadly attribution graph methods, is the significant engineering effort required to train, analyze, and iterate on them. This library aims to reduce that overhead by providing a clean, scalable, and extensible framework.
 
 ## Features
 
-This library currently implements L1-regularized CLTs with the following design principles:
+This library currently implements L1-regularized JumpReLU CLTs with the following design principles:
 
 - Follows [Anthropic](https://transformer-circuits.pub/2025/january-update/index.html)'s training guidelines
 - Supports feature sharding across GPUs (as well as DDP and FSDP)  
 - Includes activation caching and compression/quantization of the activations  
 - Adopts a structure similar to [SAE Lens](https://github.com/jbloomAus/SAELens) (code design, activation-store, etc.) and uses [Transformer Lens](https://github.com/TransformerLensOrg/TransformerLens)
 
-## Compatibility and Tooling
+## Stay-Tuned
 
-CLTs trained with this library are compatible with [circuit-tracer](https://github.com/safety-research/circuit-tracer) workflows.
-
-We also plan to release (March 2026):
+We also plan to release within the same package (March 2026):
 - An automatic interpretability pipeline  
 - A visual interface for exploring features and attribution graphs  
   - Similar in spirit (but simpler) to [Neuronpedia](https://github.com/hijohnnylin/neuronpedia)
-  - Including attention attribution support (as in [SparseAttention]https://arxiv.org/abs/2512.05865)
+  - Including attention attribution support (as in [SparseAttention](https://arxiv.org/abs/2512.05865))
+
+We welcome contributions to the library. Please refer to [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and templates. If you are interested in collaboration, you can also request access to the following [document](https://docs.google.com/document/d/1-qi6uROKHPxac0zID1EcSASDpi4Q2RIa-nDFiXJq2bw/edit?usp=sharing) with cool CLT improvement ideas. Finally, if you have any questions or want to discuss potential improvements/collaboration, write to us on the [librabry discord](https://discord.gg/q5cHK39E) ! 
 
 ## Quick Start
 
@@ -45,7 +43,7 @@ Training happens in **two steps**:
 from clt import ActivationsStore, clt_training_runner_config, load_model
 
 # Load model
-model = load_model("gpt2-small", device="cuda")
+model = load_model("meta-llama/Llama-3.2-1B", device="cuda")
 
 # Create config
 cfg = clt_training_runner_config()
@@ -76,14 +74,18 @@ trainer.run()
 
 ## ⚙️ Notes
 -   We provide screenshot examples of training metrics in the [output](./outputs) folder
--   The activation generation step is typically ran on large datasets
-    (e.g. \~200M tokens from [The Pile](https://pile.eleuther.ai))
--   Compression is optional but recommended for large-scale runs
--   Use bf16 for big models (autocasting with activations and weights in bf16 but final loss and gradient states in 32)
--   Use gradient accumulation if needed to reach 4-8k batch
--   We provide a sample script to map model weigths to [circuit-tracer](https://github.com/safety-research/circuit-tracer) in the [file](./src/clt/circuit-tracer/map_to_circuit_tracer.py). 
+-   Compression is optional but recommended for large-scale runs (e.g. 1B +)
+-   Training with bf16 is fine (autocasting with activations and weights in bf16 but gradient states in 32) but requires higher lr (around 1.5-2x bigger)
+-   For Llama 1B, on a full 8 gpu H100 node, we reach an expansion factor of 42 with micro-batch size 512
+-   We provide a sample script to map model weigths to [circuit-tracer](https://github.com/safety-research/circuit-tracer) in the [file](./src/clt/circuit-tracer/map_to_circuit_tracer.py)
+-   There has been recent criticism of the faithfulness of CLTs (see [post](https://www.lesswrong.com/posts/6CS2NDmoLCFcEJMor/cross-layer-transcoders-are-incentivized-to-learn-unfaithful)). We are also currently studying this phenomenon.
 
-## Contributing
+## Citation
 
-We welcome contributions to the library.
-Please refer to [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and templates.
+```bibtex
+@misc{CircuitLab,
+  title   = {CircuitLab: A Scalable Framework for Cross-Layer Transcoders training and attribution-graph visualization},
+  author  = {Draye, Florent, Harasse Abir, T },
+  year    = {2026},
+  url     = {https://github.com/your-username/your-repo}
+}

@@ -1,6 +1,6 @@
 
 from clt.clt_training_runner import CLTTrainingRunner
-from runners.gpt2.config import clt_training_runner_config
+from runners.llama1b.config import clt_training_runner_config
 from clt import logger
 
 import os

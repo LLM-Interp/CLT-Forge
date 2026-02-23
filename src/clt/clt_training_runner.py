@@ -95,11 +95,11 @@ class CLTTrainingRunner:
 
         self.activations_store = ActivationsStore(
             self.model,
-            self.cfg, 
-            rank=self.rank, 
+            self.cfg,
+            rank=self.rank,
             world_size=self.world_size
         )
-
+        
         if self.cfg.from_pretrained_path is not None:
             self.clt = CLT._load_from_pretrained(
                 self.cfg.from_pretrained_path,

@@ -7,15 +7,17 @@ from clt.training.compressed_activations_store import CompressionConfig
 
 from sae_lens.load_model import load_model
 from infra.jobs_id import compute_job_split_range
-from runners.gpt2.config import clt_training_runner_config
+from runners.llama1b.config import clt_training_runner_config
 
 def main(job_id: int, total_jobs: int):
     """
     Generate and saving the activations is highly parallelizable. Ideally this script should ran on my instances in parallel
     """
     cfg = clt_training_runner_config(generation=True)
+    cached_activations_path = cfg.cached_activations_path
+    cfg.cached_activations_path = None
 
-    total_splits = 1024
+    total_splits = 128
     split_begin_idx, split_end_idx = compute_job_split_range(
         job_id=job_id,
         total_jobs=total_jobs,
@@ -23,11 +25,11 @@ def main(job_id: int, total_jobs: int):
     )
 
     # number of token activations to save, could more than total_training_tokens 
-    number_of_tokens = 301989888
+    number_of_tokens = 8_000_000
 
     print(f"Job {job_id}: Processing splits {split_begin_idx} to {split_end_idx-1}")
 
-    if cfg.is_multilingual_split_dataset: 
+    if cfg.is_multilingual_split_dataset:
         patch_official_model_names()
         patch_convert_hf_model_config()
 
@@ -38,10 +40,11 @@ def main(job_id: int, total_jobs: int):
         model_from_pretrained_kwargs=cfg.model_from_pretrained_kwargs,
     )
 
+    # compression divides size by around 4 but makes the caching slower
     compression_config = CompressionConfig(
         quantization="int8",
         compression="zstd", 
-        compression_level=3,
+        compression_level=3, # lower if too slow, personal experience, it is worth waiting
     )
 
     activations_store = ActivationsStore(
@@ -50,12 +53,12 @@ def main(job_id: int, total_jobs: int):
     )
 
     activations_store.generate_and_save_activations(
-        path=cfg.cached_activations_path,
+        path=cached_activations_path,
         split_count=total_splits, 
         number_of_tokens=number_of_tokens,
         split_begin_idx=split_begin_idx,
         split_end_idx=split_end_idx,
-        use_compression=True,           
+        use_compression=False,           
         compression_config=compression_config, 
     )
 

@@ -14,9 +14,10 @@ def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: b
     activations_root = artifact_root / Path("activations") / MODEL
     checkpoints_root = artifact_root / Path("checkpoints") / MODEL
 
+    gradient_accumulation_steps = 4
     total_training_steps = 300_000 // world_size
-    train_batch_size_tokens = world_size * 1024
-    total_training_tokens = train_batch_size_tokens * total_training_steps
+    train_batch_size_tokens = world_size * 64
+    total_training_tokens = gradient_accumulation_steps * train_batch_size_tokens * total_training_steps
 
     lr_decay_steps = (total_training_steps // 20) - 1
     final_lr_scale = 0.0
@@ -26,14 +27,9 @@ def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: b
     l0_warm_up_steps = int(0.7 * total_training_steps) - l0_waiting_steps - 1
     decay_stable_steps = total_training_steps - l0_warm_up_steps - lr_decay_steps
 
-    functional_loss = "kl"
-    fc_coefficient = 0
-    fc_warm_up_steps = 1000
-    fc_waiting_steps = total_training_steps - fc_warm_up_steps - 1
-
     cfg = CLTTrainingRunnerConfig(
         device="cuda",
-        dtype="float16",
+        dtype="bfloat16",
         seed=42,
         n_checkpoints=0,
         checkpoint_path=str(checkpoints_root),
@@ -41,10 +37,10 @@ def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: b
         model_class_name="HookedTransformer",
         model_name=MODEL,
         dataset_path="chanind/openwebtext-llama3",
-        context_size=16,
+        context_size=64,
         from_pretrained_path=None,
-        d_in=768,
-        expansion_factor=32,
+        d_in=2048,
+        expansion_factor=48,
         jumprelu_init_threshold=0.03,
         jumprelu_bandwidth=1.0,
         cached_activations_path=str(activations_root),
@@ -66,17 +62,13 @@ def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: b
         checkpoint_l0=[10], # which l0 checkpoint to save
         optimal_l0=10, # when to stop training, this is per layer 0, so total l0 is 120
         log_to_wandb=True,
-        wandb_project=f"{MODEL}-clt",
+        wandb_project="Llama-3.2-1B-clt",
         wandb_id=get_synced_wandb_id(rank),
         wandb_log_frequency=10,
         eval_every_n_wandb_logs=100,
         run_name=None,
         wandb_entity=None,
-        distributed_setup=distributed_setup,
-        functional_loss=functional_loss,
-        fc_coefficient=fc_coefficient,
-        fc_warm_up_steps=fc_warm_up_steps,
-        fc_waiting_steps=fc_waiting_steps,
+        distributed_setup=distributed_setup
     )
 
     return cfg

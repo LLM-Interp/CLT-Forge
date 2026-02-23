@@ -63,7 +63,7 @@ class CLTTrainingRunnerConfig(BaseModel):
     # ------Functional Loss------------------
     functional_loss: Optional[str] = None
     fc_warm_up_type: str = "cosine"
-    fc_coefficient: float = 1e-3
+    fc_coefficient: float = 0
     fc_warm_up_steps: Optional[int] = None
     fc_waiting_steps: Optional[int] = None
 
@@ -261,7 +261,7 @@ class CLTTrainingRunnerConfig(BaseModel):
     @property
     def total_training_steps(self) -> int:
         n_training_steps = int(self.total_training_tokens // self.train_batch_size_tokens)
-        return n_training_steps // self.gradient_accumulation_steps
+        return n_training_steps
 
     @property
     def is_distributed(self) -> bool:

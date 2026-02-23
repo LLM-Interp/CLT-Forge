@@ -97,7 +97,7 @@ class CLTTrainer():
         self.monitoring_l0 = None
         self.accumulation_step: int = 0
 
-    def _initialize_b_enc(self, n_batches: int = 3):
+    def _initialize_b_enc(self, n_batches: int = 2):
 
         model = self._get_clt()
 
@@ -462,9 +462,9 @@ class CLTTrainer():
         return full_feat_act
 
     def _build_train_step_log_dict(self, loss_metrics: LossMetrics) -> Dict:
-        act_out = loss_metrics.act_out
-        feature_acts = loss_metrics.feature_acts
-        act_pred = loss_metrics.act_pred
+        act_out = loss_metrics.act_out.float()
+        feature_acts = loss_metrics.feature_acts.float()
+        act_pred = loss_metrics.act_pred.float()
         loss = loss_metrics.mse_loss + loss_metrics.l0_loss # TODO, need to change this
         clt_model = self._get_clt()
         dead_features_per_layer = clt_model.get_dead_features().sum(dim=1)

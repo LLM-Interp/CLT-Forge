@@ -71,9 +71,9 @@ class CLT(nn.Module):
         )
         self.max_layers_out = int(self.N_layers_out.max().item())
 
-        # All parameters are created on init_device
-        self.W_enc = nn.Parameter(torch.empty(self.N_layers, self.d_in, self.local_d_latent, dtype=self.dtype, device=init_device))
-        self.b_enc = nn.Parameter(torch.zeros(self.N_layers, self.local_d_latent, dtype=self.dtype, device=init_device))
+        # encoding parameters are kept in float32
+        self.W_enc = nn.Parameter(torch.empty(self.N_layers, self.d_in, self.local_d_latent, device=init_device, dtype=self.dtype))
+        self.b_enc = nn.Parameter(torch.zeros(self.N_layers, self.local_d_latent, device=init_device, dtype=self.dtype))
 
         if cfg.cross_layer_decoders:
             self.N_dec = self.N_layers * (self.N_layers + 1) // 2
@@ -185,11 +185,11 @@ class CLT(nn.Module):
         if layer is None: 
             hidden_pre = (torch.einsum( # double check einsum and autocast
                 "bnd,ndk->bnk",
-                x.float(),
-                self.W_enc.float(),
-            ) + self.b_enc.float()).to(x.dtype)
+                x,
+                self.W_enc,
+            ) + self.b_enc)
 
-            thresh = torch.exp(self.log_threshold.float()) #shape [N_layers, d_latent]
+            thresh = torch.exp(self.log_threshold) #shape [N_layers, d_latent]
         else: 
             assert 0 <= layer < self.N_layers, f"Layer {layer} out of range"
             hidden_pre = F.linear(
@@ -199,7 +199,7 @@ class CLT(nn.Module):
             )            
             thresh = torch.exp(self.log_threshold[layer]) 
         
-        feat_act = JumpReLU.apply(hidden_pre.float(), thresh, self.bandwidth).to(hidden_pre.dtype)
+        feat_act = JumpReLU.apply(hidden_pre, thresh, self.bandwidth)
         return feat_act, hidden_pre
 
     def decode(
@@ -234,7 +234,7 @@ class CLT(nn.Module):
                 
                 # Add bias after aggregation (not inside sharded block)
                 b_contrib = torch.zeros(1, self.N_layers, self.d_in, dtype=contrib.dtype, device=contrib.device)
-                b_contrib = b_contrib.index_add(1, self.k_idx, self.b_dec.to(out.dtype).unsqueeze(0))
+                b_contrib = b_contrib.index_add(1, self.k_idx, self.b_dec.unsqueeze(0))
                 out = out + b_contrib
 
             else:
@@ -295,8 +295,11 @@ class CLT(nn.Module):
         return (loss, metrics) if return_metrics else loss
 
     def loss(self, act_in: torch.Tensor, act_out: torch.Tensor, l0_coef: float, df_coef: float) -> LossMetrics:
+        ### We manually map final predictions to float32 for stability
         feat_act, hidden_pre = self.encode(act_in)
-        act_pred = self.decode(feat_act)
+        assert torch.isfinite(hidden_pre).all(), "NaN in hidden_pre"
+        assert torch.isfinite(feat_act).all(), "NaN in feat_act"
+        act_pred = self.decode(feat_act.to(self.dtype))
 
         ### MSE loss
         mse_loss_tensor = torch.nn.functional.mse_loss(act_out.float(), act_pred.float(), reduction="none")
@@ -313,7 +316,7 @@ class CLT(nn.Module):
         weighted_activations = feat_act.float() * feature_norms_local
         tanh_weighted_activations = torch.tanh(C_l0_COEF * weighted_activations)
         l0_loss_accross_layers = l0_coef * tanh_weighted_activations.sum(dim=-1).mean(dim=0)
-        l0_loss = l0_loss_accross_layers.sum()
+        l0_loss = l0_loss_accross_layers.sum().float()
         
         # SUM losses across ranks using autograd-aware all_reduce
         if self.cfg.is_sharded:
@@ -386,6 +389,7 @@ class CLT(nn.Module):
         weights_path = path / f"{prefix}{CLT_WEIGHTS_FILENAME}"
         save_file(clt_state_dict, weights_path)
 
+        cfg_path = None
         if save_cfg: 
             cfg_dict = self.cfg.to_dict()
             cfg_path = path / CLT_CFG_FILENAME
@@ -394,7 +398,7 @@ class CLT(nn.Module):
                 json.dump(cfg_dict, f)
 
         return cfg_path
-            
+
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self):
         self.W_dec.data /= torch.norm(self.W_dec.data, dim=2, keepdim=True)

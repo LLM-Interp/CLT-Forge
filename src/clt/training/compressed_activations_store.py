@@ -193,7 +193,7 @@ class CompressedActivationsStore:
         original_dtype = tensor.dtype
         
         # Move to numpy for quantization
-        data = tensor.cpu().numpy()
+        data = tensor.float().cpu().numpy()
         
         if self.config.quantization == "none":
             scale = np.array([1.0], dtype=np.float32)

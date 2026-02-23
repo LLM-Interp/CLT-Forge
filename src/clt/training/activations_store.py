@@ -144,9 +144,14 @@ class ActivationsStore:
 
         for i in range(start, end):
             toks = self.raw_ds[i]["tokens"]
+            tokenizer = getattr(self.model, "tokenizer", None)
+            bos_id = None if tokenizer is None else tokenizer.bos_token_id
 
             if not isinstance(toks, torch.Tensor):
                 toks = torch.tensor(toks, dtype=torch.long)
+            
+            if bos_id is not None and len(toks) > 0 and toks[0].item() == bos_id:
+                toks = toks[1:]
             
             doc_len = len(toks)
             truncated_len = (doc_len // (self.context_size)) * (self.context_size) # TODO before -1 to both
@@ -168,7 +173,7 @@ class ActivationsStore:
         base_iter = concat_and_batch_sequences(
             tokens_iterator=self._iterate_raw_dataset_tokens(),
             context_size=self.context_size,
-            begin_batch_token_id=None, # we dont want to prepend bos here, we add in run_with_cache TODO
+            begin_batch_token_id=None, # we dont want to prepend bos here, we add in run_with_cache
             begin_sequence_token_id=None,
             sequence_separator_token_id=bos_id,
         )
@@ -344,24 +349,25 @@ class ActivationsStore:
         norms_per_layer_in = []
         norms_per_layer_out = []
 
-        self.estimated_norm_scaling_factor_in = torch.ones(self.N_layers, dtype=self.dtype, device="cpu")
-        self.estimated_norm_scaling_factor_out = torch.ones(self.N_layers, dtype=self.dtype, device="cpu")
+        self.estimated_norm_scaling_factor_in = torch.ones(self.N_layers, device="cpu").float()
+        self.estimated_norm_scaling_factor_out = torch.ones(self.N_layers, device="cpu").float()
 
         for _ in tqdm(range(n_batches_for_norm_estimate), 
                       desc="Estimating norm scaling factor", 
                       disable=(self.rank != 0)): 
             
-            # cache_ptr is aligned across all GPUs.
+            # cache_ptr is aligned across all nodes.
             acts_in, acts_out = next(iter(self))
 
             if self.rank == 0:
-                norms_per_layer_in.append(acts_in.norm(dim=-1).mean(dim=0))
-                norms_per_layer_out.append(acts_out.norm(dim=-1).mean(dim=0))
+                norms_per_layer_in.append(acts_in.norm(dim=-1).mean(dim=0).float())
+                norms_per_layer_out.append(acts_out.norm(dim=-1).mean(dim=0).float())
             
             del acts_in, acts_out
             torch.cuda.empty_cache()
 
         if self.rank == 0:
+
             mean_norm_per_layer_in = torch.stack(norms_per_layer_in, dim=0).mean(dim=0)
             mean_norm_per_layer_out = torch.stack(norms_per_layer_out, dim=0).mean(dim=0)
             
@@ -373,7 +379,7 @@ class ActivationsStore:
             logger.info(f"Estimated norm scaling factor in: {self.estimated_norm_scaling_factor_in}")
             logger.info(f"Estimated norm scaling factor out: {self.estimated_norm_scaling_factor_out}")
 
-        return self.estimated_norm_scaling_factor_in, self.estimated_norm_scaling_factor_out    
+        return self.estimated_norm_scaling_factor_in.to(self.dtype), self.estimated_norm_scaling_factor_out.to(self.dtype)  
 
     @torch.no_grad()
     def set_norm_scaling_factor_if_needed(self):
@@ -542,7 +548,7 @@ class ActivationsStore:
 
             if self.cached_act_in.shape[0] < self.n_train_batch_per_buffer * self.cfg.train_batch_size_tokens: 
                 raise ValueError(
-                    "Buffer size greater than split size"
+                    f"Buffer size {self.n_train_batch_per_buffer * self.cfg.train_batch_size_tokens} greater than split size {self.cached_act_in.shape[0]}"
                 )
 
             self.leftover_activations = None
@@ -595,12 +601,21 @@ class ActivationsStore:
                 activations_path = activation_split_path(self.cfg.cached_activations_path, self.context_size, self.split)
                 if not os.path.exists(activations_path):
                     raise FileNotFoundError(f"No cached activations found at {activations_path}")
-    
-            # Load uncompressed
-            tensors = load_file(activations_path)
-            self.cached_act_in = tensors["act_in"].to(self.dtype).cpu()
-            self.cached_act_out = tensors["act_out"].to(self.dtype).cpu()
-            self.cached_tokens = tensors["tokens"].cpu()
+
+            if self.cfg.is_sharded:
+                # first process loads to RAM
+                for r in range(self.world_size):
+                    if self.rank == r:
+                        tensors = load_file(activations_path)
+                        self.cached_act_in = tensors["act_in"].to(self.dtype).cpu()
+                        self.cached_act_out = tensors["act_out"].to(self.dtype).cpu()
+                        self.cached_tokens = tensors["tokens"].cpu()
+                    dist.barrier()
+            else: 
+                tensors = load_file(activations_path)
+                self.cached_act_in = tensors["act_in"].to(self.dtype).cpu()
+                self.cached_act_out = tensors["act_out"].to(self.dtype).cpu()
+                self.cached_tokens = tensors["tokens"].cpu()
     
             logger.info(f"[ActivationsStore] Loaded uncompressed split {self.split} "
                         f"with {self.cached_act_in.shape[0]} samples from {activations_path}")
