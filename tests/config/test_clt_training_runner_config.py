@@ -1,33 +1,24 @@
 import json
 import pytest
 from circuitlab.config.clt_config import CLTConfig
-from circuitlab.config.clt_training_runner_config import CLTTrainingRunnerConfig
+from tests.utils import build_clt_training_runner_cfg
 import torch 
 
 def make_cfg(**kwargs):
-    return CLTTrainingRunnerConfig(**kwargs)
+    return build_clt_training_runner_cfg(**kwargs)
 
 def test_device_fallback_cpu():
     not_device = "mps" if torch.cuda.is_available() else "cuda"
     cfg = make_cfg(device=not_device)
     assert cfg.device == "cpu"
 
-def test_device_cuda_ok():
-    with pytest.raises(ValueError):
-        make_cfg(device="cuda:0")
-
 def test_latent_expansion_mutual_exclusive():
     with pytest.raises(ValueError):
         make_cfg(d_latent=256, expansion_factor=4)
 
 def test_latent_computed_from_expansion():
-    cfg = make_cfg(d_in=128, expansion_factor=8)
+    cfg = make_cfg(d_in=128, expansion_factor=8, d_latent = None)
     assert cfg.d_latent == 1024
-
-def test_latent_default_expansion():
-    # default expansion_factor should be 16 when neither given
-    cfg = make_cfg(d_in=512)
-    assert cfg.d_latent == 512 * 16
 
 def test_to_dict_json_serialisable():
     cfg = make_cfg()

@@ -33,6 +33,7 @@ def build_clt_training_runner_cfg(**kwargs: Any) -> CLTTrainingRunnerConfig:
         "checkpoint_path": "test/checkpoints",
         "n_checkpoints": 1,
         "dead_feature_window": 1, 
+        "distributed_setup": "None"
     }
 
     for key, value in kwargs.items():
