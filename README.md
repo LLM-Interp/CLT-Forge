@@ -2,9 +2,9 @@
   <img src="./images/image.png" alt="CLT banner" width="800"/>
 </p>
 
-[![Python](https://img.shields.io/badge/python-3.11-blue)]()
-[![PyTorch](https://img.shields.io/badge/framework-pytorch-red)]()
-[![Poetry](https://img.shields.io/badge/packaging-poetry-cyan)]()
+[![Python](https://img.shields.io/badge/python-3.11-blue)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/framework-pytorch-red)](https://pytorch.org/)
+[![Poetry](https://img.shields.io/badge/packaging-poetry-cyan)](https://python-poetry.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 **CircuitLab** is a Python library for training [Cross-Layer Transcoders](https://transformer-circuits.pub/2025/attribution-graphs/methods.html) (CLTs) at scale. It will soon include an automatic intepretability pipeline and a visual interface. 
