@@ -7,7 +7,9 @@
 [![Poetry](https://img.shields.io/badge/packaging-poetry-cyan)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**CircuitLab** is a Python library for training Cross-Layer Transcoders (CLTs) at scale. We believe that a major limitation in the development of CLTs, and more broadly attribution graph methods, is the significant engineering effort required to train, analyze, and iterate on them. This library aims to reduce that overhead by providing a clean, scalable, and extensible framework.
+**CircuitLab** is a Python library for training Cross-Layer Transcoders (CLTs) at scale. It will soon include an automatic intepretability pipeline and a visual interface. 
+
+We believe that a major limitation in the development of CLTs, and more broadly attribution graph methods, is the significant engineering effort required to train, analyze, and iterate on them. This library aims to reduce that overhead by providing a clean, scalable, and extensible framework.
 
 ## Features
 
@@ -30,7 +32,7 @@ We also plan to release within the same package (March 2026):
 
 Training happens in **two steps**:
 
-1.  **Precompute activations** (should be parallelized across indepedent jobs)\
+1.  **Precompute activations** (should be parallelized across indepedent jobs)
 2.  **Train the CLT model** on the cached activations (should run on a single multi-gpu node)
 
 ------------------------------------------------------------------------
@@ -71,8 +73,8 @@ trainer.run()
 ------------------------------------------------------------------------
 
 ## ⚙️ Notes
--   We provide screenshot examples of training metrics in the [output](./outputs) folder
--   Compression is optional but recommended for large-scale runs (e.g. 1B +)
+-   We provide screenshot examples of training metrics in the [output](./outputs) folder and sample training scripts in [runners](./runners/)
+-   Compression is optional but recommended for large-scale runs (e.g. 1B +) with 4-8x memory reduction
 -   Training with bf16 is fine (autocasting with activations and weights in bf16 but gradient states in 32) but requires higher lr (around 1.5-2x bigger)
 -   For Llama 1B, on a full 8 gpu H100 node, we reach an expansion factor of 42 with micro-batch size 512
 -   We provide a sample script to map model weigths to [circuit-tracer](https://github.com/safety-research/circuit-tracer) in the [file](./src/circuitlab/circuit-tracer/map_to_circuit_tracer.py)
@@ -82,8 +84,8 @@ trainer.run()
 
 ```bibtex
 @misc{CircuitLab,
-  title   = {CircuitLab: A Scalable Framework for Cross-Layer Transcoders training and attribution-graph visualization},
+  title   = {CircuitLab: A Scalable Framework for Cross-Layer Transcoders Training and Attribution-Graph Visualization},
   author  = {Draye, Florent, Harasse Abir, T },
   year    = {2026},
-  url     = {https://github.com/your-username/your-repo}
+  url     = {https://github.com/CLT-Training/CLT/}
 }
