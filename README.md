@@ -91,3 +91,10 @@ trainer.run()
   year    = {2026},
   url     = {https://github.com/CLT-Training/CLT/}
 } -->
+
+<!-- @misc{CircuitLab2026,
+  title   = {CircuitLab: A Scalable Framework for Cross-Layer Transcoders Training and Attribution-Graph Visualization},
+  author  = {Florent Draye and Abir Harrasse and Vedant Palit and TY Wu and Jiarui Liu and PS Pandey and Roderick Wu and Zhijing Jin and Bernhard Sch{\"o}lkopf},
+  year    = {2026},
+  url     = {https://github.com/CLT-Training/CLT/}
+} -->
