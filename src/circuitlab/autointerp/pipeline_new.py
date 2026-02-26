@@ -1,600 +1,667 @@
-# import os
-# import json
-# from pathlib import Path
-# from typing import Any, Dict, List, Optional, Tuple
-
-# import torch
-
-# from circuitlab.config import AutoInterpConfig
-# from circuitlab.utils import LatentCache_CFG_FILENAME, DICT_FOLDERNAME
-# from circuitlab.clt import CLT
-# from circuitlab.load_model import load_model
-# from circuitlab.training.activations_store import ActivationsStore
-# from circuitlab import logger
-# from circuitlab.transformer_lens.multilingual_patching import (
-#     patch_official_model_names,
-#     patch_convert_hf_model_config,
-# )
-# from circuitlab.training.optim import JumpReLU
-
-# os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-# TOP_K_DEFAULT = 100
-# N_TOP_ACTIVATING_TOKENS_SHOWN = 4
-
-# class AutoInterp:
-#     """
-#     Feature-parallel AutoInterp.
-
-#     Key idea:
-#       - parallelize over `index_list` (feature ids)
-#       - keep CLT on CPU
-#       - move only W_enc[:, :, index_list], b_enc[:, index_list], log_threshold[:, index_list] to GPU
-#       - stream activations (x) from ActivationsStore
-#       - maintain top-K per feature (values + tokens + ctx activations), per layer
-#       - use the payload directly to create the feature dictionaries
-
-#     This avoids:
-#       - saving huge per-chunk latent caches
-#       - reloading chunks per split
-#       - heap loops over 50k features
-#     """
-
-#     def __init__(self, cfg: AutoInterpConfig):
-#         self.cfg = cfg
-#         self.total_autointerp_tokens = cfg.total_autointerp_tokens
-#         self.device = torch.device(self.cfg.device)
-#         self.ctx = cfg.context_size
-
-#         patch_official_model_names()
-#         patch_convert_hf_model_config()
-
-#         self.model = load_model(
-#             self.cfg.model_class_name,
-#             self.cfg.model_name,
-#             device=self.device,
-#             model_from_pretrained_kwargs=self.cfg.model_from_pretrained_kwargs,
-#         )
-
-#         # CLT stays on CPU. We'll slice/move the necessary encoder params per split.
-#         self.clt = CLT.load_from_pretrained(self.cfg.clt_path, "cpu")
-
-#         self.activations_store = ActivationsStore(
-#             self.model,
-#             self.cfg,
-#             estimated_norm_scaling_factor_in=self.clt.estimated_norm_scaling_factor_in,
-#             estimated_norm_scaling_factor_out=self.clt.estimated_norm_scaling_factor_out,
-#         )
-
-#     def run(
-#         self,
-#         *,
-#         worker_id: str,
-#         index_list: List[int],
-#         top_k: int = TOP_K_DEFAULT,
-#         save_dir: Optional[Path] = None,
-#         dtype: Optional[torch.dtype] = None,
-#     ) -> Path:
-#         """
-#         Stream over data once, compute top-K per feature (index_list),
-#         and directly write feature dictionaries.
-#         """
-
-#         if not index_list:
-#             raise ValueError("index_list must be non-empty.")
-
-#         if save_dir is None:
-#             if self.cfg.latent_cache_path is None:
-#                 raise ValueError("cfg.latent_cache_path must be set or pass save_dir.")
-#             save_dir = Path(self.cfg.latent_cache_path)
-
-#         save_dir.mkdir(parents=True, exist_ok=True)
-
-#         # Save config once
-#         cfg_path = save_dir / LatentCache_CFG_FILENAME
-#         cfg_path.write_text(json.dumps(self.cfg.to_dict()))
-#         logger.info(f"Latent cache config saved to: {cfg_path}")
-
-#         run_dtype = dtype if dtype is not None else self.activations_store.dtype
-#         self._prepare_encoder_subset(index_list=index_list, dtype=run_dtype)
-
-#         state: Optional[Dict[str, Any]] = None
-#         iterator = iter(self.activations_store)
-#         n_tokens = 0
-
-#         while n_tokens < self.cfg.total_autointerp_tokens:
-#             tokens_cpu, acts_in, _ = next(iterator)
-
-#             # Move only inputs
-#             x = acts_in.to(self.device, dtype=run_dtype)
-
-#             with torch.no_grad():
-#                 feat_act_sub = self._encode_subset(x)  # [B, L, F]
-
-#             # Convert to sequences
-#             tokens_seq, acts_seq = self._to_sequences(tokens_cpu, feat_act_sub)
-
-#             n_tokens += int(feat_act_sub.shape[0])
-
-#             if tokens_seq.shape[0] > 0:
-#                 if state is None:
-#                     n_layers = int(acts_seq.shape[2])
-#                     state = self._init_topk_state(
-#                         n_layers=n_layers,
-#                         F=len(index_list),
-#                         top_k=top_k,
-#                         ctx=self.ctx,
-#                         dtype=run_dtype,
-#                         device=self.device,
-#                     )
-
-#                 self._update_state_with_batch(
-#                     state=state,
-#                     tokens_seq_cpu=tokens_seq,
-#                     acts_seq_gpu=acts_seq,
-#                     top_k=top_k,
-#                 )
-
-#             del x, feat_act_sub, acts_seq
-
-#             if self.device.type == "cuda":
-#                 torch.cuda.empty_cache()
-
-#         if state is None:
-#             raise RuntimeError("No sequences processed; state was never initialized.")
-
-#         payload = self._state_to_cpu_payload(
-#             state=state,
-#             index_list=index_list,
-#             worker_id=worker_id,
-#             top_k=top_k,
-#             dtype=run_dtype,
-#         )
-
-#         if self.cfg.latent_cache_path is not None:
-#             dict_root = Path(self.cfg.latent_cache_path) / DICT_FOLDERNAME
-#         else:
-#             dict_root = save_dir / DICT_FOLDERNAME
-
-#         n_layers = len(payload["top_vals_by_layer"])
-
-#         for layer in range(n_layers):
-#             self._write_feature_dicts_for_layer_from_payload(
-#                 layer=layer,
-#                 payload=payload,
-#                 out_dir=dict_root / f"layer{layer}",
-#             )
-
-#         logger.info(f"Finished AutoInterp run for worker {worker_id}")
-
-#         return save_dir
-
-#     def _write_feature_dicts_for_layer_from_payload(
-#         self,
-#         *,
-#         layer: int,
-#         payload: Dict[str, Any],
-#         out_dir: Path,
-#         index_list: Optional[List[int]] = None,
-#     ) -> None:
-#         """
-#         Write per-feature JSON dictionaries for a given layer directly from an in-memory payload.
-#         """
-
-#         out_dir.mkdir(parents=True, exist_ok=True)
-
-#         all_feats: List[int] = payload["index_list"]
-#         if index_list is None:
-#             use_feats = all_feats
-#         else:
-#             use_set = set(index_list)
-#             use_feats = [f for f in all_feats if f in use_set]
-
-#         top_k = int(payload["top_k"])
-#         ctx = int(payload["ctx"])
-#         if ctx != self.ctx:
-#             raise ValueError(f"Payload ctx={ctx} != self.ctx={self.ctx}")
-
-#         top_vals: torch.Tensor = payload["top_vals_by_layer"][layer]      # [K, F]
-#         top_tokens: torch.Tensor = payload["top_tokens_by_layer"][layer]  # [K, F, ctx]
-#         top_acts: torch.Tensor = payload["top_acts_by_layer"][layer]      # [K, F, ctx]
-#         sum_pos: torch.Tensor = payload["sum_pos_by_layer"][layer]        # [F]
-#         count_pos: torch.Tensor = payload["count_pos_by_layer"][layer]    # [F]
-
-#         if top_vals.dim() != 2:
-#             raise ValueError(f"top_vals has wrong shape: {tuple(top_vals.shape)}")
-#         if top_tokens.dim() != 3 or top_acts.dim() != 3:
-#             raise ValueError(
-#                 f"top_tokens/top_acts have wrong shapes: "
-#                 f"{tuple(top_tokens.shape)} / {tuple(top_acts.shape)}"
-#             )
-
-#         K, F = top_vals.shape
-#         if K != top_k or F != len(all_feats):
-#             raise ValueError(
-#                 f"Payload shapes inconsistent. "
-#                 f"top_vals: {tuple(top_vals.shape)}, expected ({top_k}, {len(all_feats)})"
-#             )
-
-#         tokenizer = self.model.tokenizer
-
-#         # Precompute mapping feature_id -> column index in [0..F-1]
-#         feat_to_col: Dict[int, int] = {feat_id: j for j, feat_id in enumerate(all_feats)}
-
-#         for feat_id in use_feats:
-#             j = feat_to_col[feat_id]
-
-#             # Build sequence list in descending order (topk is already sorted by value due to torch.topk)
-#             sequences: List[Dict[str, Any]] = []
-#             for k in range(top_k):
-#                 v = float(top_vals[k, j].item())
-#                 if v == float("-inf"):
-#                     continue
-#                 sequences.append(
-#                     {
-#                         "tokens": top_tokens[k, j],       # [ctx]
-#                         "activations": top_acts[k, j],    # [ctx]
-#                         "max_val": v,
-#                     }
-#                 )
-
-#             top_examples: List[str] = []
-#             sequences_serializable: List[Dict[str, Any]] = []
-
-#             for s in sequences:
-#                 # keep the same “remove BOS” behavior as your original code
-#                 tks = s["tokens"][1:]
-#                 acts = s["activations"][1:]
-#                 top_examples.append(
-#                     highlight_activations(tks, acts, tokenizer, threshold_ratio=0.6)
-#                 )
-#                 sequences_serializable.append(
-#                     {
-#                         "tokens": s["tokens"].tolist(),
-#                         "activations": s["activations"].tolist(),
-#                         "max_val": float(s["max_val"]),
-#                     }
-#                 )
-
-#             top_activating_tokens = self._get_top_activating_tokens_from_sequences(
-#                 sequences=sequences,
-#                 tokenizer=tokenizer,
-#                 top_k=N_TOP_ACTIVATING_TOKENS_SHOWN,
-#                 threshold_ratio=0.6,
-#             )
-
-#             c = int(count_pos[j].item())
-#             avg_activation = float(sum_pos[j].item()) / c if c > 0 else 0.0
-
-#             feature_dict = {
-#                 "layer": int(layer),
-#                 "feature_index": int(feat_id),
-#                 "description": "Unknown",
-#                 "explanation": "No explanation generated",
-#                 "top_examples": top_examples,
-#                 "top_examples_tks": sequences_serializable,
-#                 "average_activation": float(avg_activation),
-#                 "top_activating_tokens": top_activating_tokens,
-#                 "raw_explanation": "",
-#             }
-
-#             feature_file = out_dir / f"feature_{feat_id}_complete.json"
-#             feature_file.write_text(json.dumps(feature_dict, indent=2))
-
-#         logger.info(
-#             f"Wrote {len(use_feats)}/{len(all_feats)} feature dictionaries "
-#             f"for layer {layer} to: {out_dir}"
-#         )
-
-#     def _prepare_encoder_subset(self, *, index_list: List[int], dtype: torch.dtype) -> None:
-#         """
-#         Prepare (and cache on GPU) only the encoder parameters needed for `index_list`.
-#         """
-#         if not index_list:
-#             raise ValueError("index_list must be non-empty.")
-
-#         # Slice on CPU (CLT is on CPU), then move to GPU
-#         idx = torch.as_tensor(index_list, dtype=torch.long, device="cpu")
-
-#         W_sub = self.clt.W_enc[:, :, idx]          # [L, d_in, F]
-#         b_sub = self.clt.b_enc[:, idx]             # [L, F]
-#         lt_sub = self.clt.log_threshold[:, idx]    # [L, F]
-
-#         self._enc_index_list = list(index_list)
-#         self._W_enc_sub = W_sub.to(self.device, dtype=dtype, non_blocking=True)
-#         self._b_enc_sub = b_sub.to(self.device, dtype=dtype, non_blocking=True)
-#         self._threshold_sub = torch.exp(lt_sub).to(self.device, dtype=dtype, non_blocking=True)
-#         self._bandwidth = self.clt.bandwidth
-
-#     @torch.no_grad()
-#     def _encode_subset(self, x: torch.Tensor) -> torch.Tensor:
-#         """
-#         x:   [B, L, d_in]
-#         out: [B, L, F]
-#         """
-#         if not hasattr(self, "_W_enc_sub"):
-#             raise RuntimeError("Call _prepare_encoder_subset(index_list=..., dtype=...) before _encode_subset().")
-
-#         hidden_pre = torch.einsum("bld,ldf->blf", x, self._W_enc_sub) + self._b_enc_sub  # [B, L, F]
-#         thresh = self._threshold_sub                                       # [L, F]
-#         feat_act = JumpReLU.apply(hidden_pre, thresh, self._bandwidth)                    # [B, L, F]
-#         return feat_act
-
-#     def _to_sequences(
-#         self, tokens_cpu: torch.Tensor, feat_act_gpu: torch.Tensor
-#     ) -> Tuple[torch.Tensor, torch.Tensor]:
-#         """
-#         tokens_cpu: [B] CPU
-#         feat_act_gpu: [B, L, F] GPU
-#         returns:
-#           tokens_seq_cpu: [B_seq, ctx] CPU
-#           acts_seq_gpu:   [B_seq, ctx, L, F] GPU
-#         """
-#         B = int(feat_act_gpu.shape[0])
-#         excess = B % self.ctx
-#         if excess != 0:
-#             feat_act_gpu = feat_act_gpu[:-excess]
-#             tokens_cpu = tokens_cpu[:-excess]
-#             B = int(feat_act_gpu.shape[0])
-
-#         if B == 0:
-#             empty_tokens = tokens_cpu.new_zeros((0, self.ctx))
-#             empty_acts = feat_act_gpu.new_zeros((0, self.ctx, feat_act_gpu.shape[1], feat_act_gpu.shape[2]))
-#             return empty_tokens, empty_acts
-
-#         B_seq = B // self.ctx
-#         tokens_seq = tokens_cpu.view(B_seq, self.ctx)  # CPU
-#         acts_seq = feat_act_gpu.view(B_seq, self.ctx, feat_act_gpu.shape[1], feat_act_gpu.shape[2])  # GPU
-#         return tokens_seq, acts_seq
-
-#     def _init_topk_state(
-#         self,
-#         *,
-#         n_layers: int,
-#         F: int,
-#         top_k: int,
-#         ctx: int,
-#         dtype: torch.dtype,
-#         device: torch.device,
-#     ) -> Dict[str, Any]:
-
-#         neg_inf = torch.full((top_k, F), float("-inf"), device=device, dtype=dtype)
-#         tok_init = torch.zeros((top_k, F, ctx), device=device, dtype=torch.int32)
-#         act_init = torch.zeros((top_k, F, ctx), device=device, dtype=dtype)
-
-#         return {
-#             "top_vals_by_layer": [neg_inf.clone() for _ in range(n_layers)],
-#             "top_tokens_by_layer": [tok_init.clone() for _ in range(n_layers)],
-#             "top_acts_by_layer": [act_init.clone() for _ in range(n_layers)],
-#             "sum_pos_by_layer": [torch.zeros((F,), device=device, dtype=dtype) for _ in range(n_layers)],
-#             "count_pos_by_layer": [torch.zeros((F,), device=device, dtype=torch.long) for _ in range(n_layers)],
-#         }
-
-#     @torch.no_grad()
-#     def _update_state_with_batch(
-#         self,
-#         *,
-#         state: Dict[str, Any],
-#         tokens_seq_cpu: torch.Tensor,  # [B_seq, ctx] CPU
-#         acts_seq_gpu: torch.Tensor,    # [B_seq, ctx, L, F] GPU
-#         top_k: int,
-#     ) -> None:
-#         """
-#         For each layer:
-#           batch_acts: [B_seq, F, ctx]
-#           batch_vals: [B_seq, F] (max over ctx)
-#           merge with global [K, F] via topk(cat) and gather tokens/acts accordingly.
-#         """
-#         B_seq = int(tokens_seq_cpu.shape[0])
-#         if B_seq == 0:
-#             return
-
-#         tokens_seq_gpu = tokens_seq_cpu.to(self.device, dtype=torch.int32)  # [B_seq, ctx]
-#         L = int(acts_seq_gpu.shape[2])
-#         F = int(acts_seq_gpu.shape[3])
-#         ctx = int(acts_seq_gpu.shape[1])
-
-#         # expand tokens across features
-#         batch_tokens = tokens_seq_gpu[:, None, :].expand(B_seq, F, ctx)  # [B_seq, F, ctx]
-
-#         for layer in range(L):
-#             # [B_seq, ctx, F] -> [B_seq, F, ctx]
-#             batch_acts = acts_seq_gpu[:, :, layer, :].permute(0, 2, 1).contiguous()
-
-#             # [B_seq, F]
-#             batch_vals = batch_acts.max(dim=2).values
-
-#             # stats
-#             pos = batch_vals > 0
-#             state["sum_pos_by_layer"][layer] += (batch_vals * pos).sum(dim=0)
-#             state["count_pos_by_layer"][layer] += pos.sum(dim=0)
-
-#             # merge
-#             top_vals = state["top_vals_by_layer"][layer]           # [K, F]
-#             top_tokens = state["top_tokens_by_layer"][layer]       # [K, F, ctx]
-#             top_acts = state["top_acts_by_layer"][layer]           # [K, F, ctx]
-
-#             merged_vals = torch.cat([top_vals, batch_vals], dim=0)          # [K+B, F]
-#             merged_tokens = torch.cat([top_tokens, batch_tokens], dim=0)    # [K+B, F, ctx]
-#             merged_acts = torch.cat([top_acts, batch_acts], dim=0)          # [K+B, F, ctx]
-
-#             new_vals, pos_idx = torch.topk(merged_vals, k=top_k, dim=0)     # [K, F], [K, F]
-#             gather_idx = pos_idx[:, :, None].expand(top_k, F, ctx)          # [K, F, ctx]
-
-#             new_tokens = torch.gather(merged_tokens, dim=0, index=gather_idx)
-#             new_acts = torch.gather(merged_acts, dim=0, index=gather_idx)
-
-#             state["top_vals_by_layer"][layer] = new_vals
-#             state["top_tokens_by_layer"][layer] = new_tokens
-#             state["top_acts_by_layer"][layer] = new_acts
-
-#         del tokens_seq_gpu, batch_tokens
-
-#     def _state_to_cpu_payload(
-#         self,
-#         *,
-#         state: Dict[str, Any],
-#         index_list: List[int],
-#         worker_id: str,
-#         top_k: int,
-#         dtype: torch.dtype,
-#     ) -> Dict[str, Any]:
-#         return {
-#             "worker_id": worker_id,
-#             "index_list": index_list,
-#             "top_k": int(top_k),
-#             "ctx": int(self.ctx),
-#             "dtype": str(dtype),
-#             "top_vals_by_layer": [t.detach().cpu() for t in state["top_vals_by_layer"]],
-#             "top_tokens_by_layer": [t.detach().cpu() for t in state["top_tokens_by_layer"]],
-#             "top_acts_by_layer": [t.detach().cpu() for t in state["top_acts_by_layer"]],
-#             "sum_pos_by_layer": [t.detach().cpu() for t in state["sum_pos_by_layer"]],
-#             "count_pos_by_layer": [t.detach().cpu() for t in state["count_pos_by_layer"]],
-#         }
-
-#     def _get_top_activating_tokens_from_sequences(
-#         self,
-#         *,
-#         sequences: List[Dict[str, Any]],
-#         tokenizer,
-#         top_k: int = 3,
-#         threshold_ratio: float = 0.6,
-#     ) -> List[Dict[str, Any]]:
-#         if not sequences:
-#             return []
-
-#         all_tokens = []
-#         all_activations = []
-#         for s in sequences:
-#             tks = s["tokens"][1:]
-#             acts = s["activations"][1:]
-#             all_tokens.append(tks)
-#             all_activations.append(acts)
-
-#         combined_tokens = torch.cat(all_tokens)
-#         combined_activations = torch.cat(all_activations)
-#         if combined_activations.numel() == 0:
-#             return []
-
-#         threshold = float(combined_activations.max().item()) * threshold_ratio
-#         mask = combined_activations > threshold
-
-#         activating_tokens = combined_tokens[mask].tolist()
-#         activating_values = combined_activations[mask].tolist()
-
-#         token_stats: Dict[int, Dict[str, float]] = {}
-#         for token_id, activation in zip(activating_tokens, activating_values):
-#             if token_id not in token_stats:
-#                 token_stats[token_id] = {"count": 0.0, "total_activation": 0.0}
-#             token_stats[token_id]["count"] += 1.0
-#             token_stats[token_id]["total_activation"] += float(activation)
-
-#         ranking: List[Dict[str, Any]] = []
-#         for token_id, stats in token_stats.items():
-#             avg_activation = stats["total_activation"] / stats["count"]
-#             token_text = tokenizer.decode([int(token_id)])
-#             ranking.append(
-#                 {
-#                     "token": token_text,
-#                     "token_id": int(token_id),
-#                     "frequency": int(stats["count"]),
-#                     "average_activation": float(avg_activation),
-#                 }
-#             )
-
-#         ranking.sort(key=lambda x: x["frequency"], reverse=True)
-#         return ranking[:top_k]
-
-
-# def highlight_activations(
-#     tokens: torch.Tensor,
-#     activations: torch.Tensor,
-#     tokenizer,
-#     threshold_ratio: float = 0.6,
-# ) -> str:
-#     assert len(tokens) == len(activations), "Token and activation lengths must match"
-
-#     max_act = activations.max().item()
-#     threshold = max_act * threshold_ratio
-#     str_tokens = tokenizer.convert_ids_to_tokens(tokens)
-
-#     highlight_mask = activations > threshold
-
-#     def contains_chinese(text: str) -> bool:
-#         return any("\u4e00" <= char <= "\u9fff" for char in text)
-
-#     full_text_sample = tokenizer.convert_tokens_to_string(str_tokens[: min(10, len(str_tokens))])
-#     is_chinese_text = contains_chinese(full_text_sample)
-
-#     extended_mask = highlight_mask.clone()
-#     if not is_chinese_text:
-#         for i in range(len(str_tokens)):
-#             if highlight_mask[i]:
-#                 j = i - 1
-#                 while (
-#                     j >= 0
-#                     and not str_tokens[j].startswith(("▁", " ", "Ġ"))
-#                     and str_tokens[j] not in ["<|endoftext|>", "</s>", "<s>", "[CLS]", "[SEP]"]
-#                 ):
-#                     extended_mask[j] = True
-#                     j -= 1
-
-#                 j = i + 1
-#                 while (
-#                     j < len(str_tokens)
-#                     and not str_tokens[j].startswith(("▁", " ", "Ġ"))
-#                     and str_tokens[j] not in ["<|endoftext|>", "</s>", "<s>", "[CLS]", "[SEP]"]
-#                 ):
-#                     extended_mask[j] = True
-#                     j += 1
-
-#     marked_tokens: List[str] = []
-#     in_highlight = False
-#     for tok, is_high in zip(str_tokens, extended_mask):
-#         if is_high and not in_highlight:
-#             marked_tokens.append("<<")
-#             in_highlight = True
-#         elif (not is_high) and in_highlight:
-#             marked_tokens.append(">>")
-#             in_highlight = False
-#         marked_tokens.append(tok)
-
-#     if in_highlight:
-#         marked_tokens.append(">>")
-
-#     segments: List[str] = []
-#     buffer: List[str] = []
-#     for tok in marked_tokens:
-#         if tok in {"<<", ">>"}:
-#             if buffer:
-#                 segments.append(tokenizer.convert_tokens_to_string(buffer))
-#                 buffer = []
-#             segments.append(tok)
-#         else:
-#             buffer.append(tok)
-
-#     if buffer:
-#         segments.append(tokenizer.convert_tokens_to_string(buffer))
-
-#     result = ""
-#     i = 0
-#     while i < len(segments):
-#         seg = segments[i]
-#         if seg == "<<":
-#             if result and not result.endswith(" "):
-#                 result += " "
-#             result += "<<"
-#             i += 1
-#             if i < len(segments):
-#                 result += segments[i].lstrip()
-#                 i += 1
-#             if i < len(segments) and segments[i] == ">>":
-#                 result += ">>"
-#                 i += 1
-#         else:
-#             if result and not result.endswith(" "):
-#                 result += " "
-#             result += seg
-#             i += 1
-
-#     return result
+"""
+Storage layout:
+    save_dir/
+      features/
+        layer_{l}/
+          job_{j}.json   ← {str(feat_id): {feature_dict}, ...}
+      prompts/           ← written only if generate_explanations=True
+      explanations/      ← written only if generate_explanations=True
+"""
+
+import os
+import json
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+
+from sae_lens.load_model import load_model
+
+from circuitlab.config import AutoInterpConfig
+from circuitlab.clt import CLT
+from circuitlab.training.activations_store import ActivationsStore
+from circuitlab.training.optim import JumpReLU
+from circuitlab.transformer_lens.multilingual_patching import (
+    patch_official_model_names,
+    patch_convert_hf_model_config,
+)
+from circuitlab.utils import DTYPE_MAP
+from circuitlab import logger
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+TOP_K_DEFAULT = 100
+N_TOP_ACTIVATING_TOKENS_SHOWN = 4
+
+
+# ---------------------------------------------------------------------------
+# Main class
+# ---------------------------------------------------------------------------
+
+class AutoInterp:
+    """
+    Single-pass streaming AutoInterp.
+
+    Usage:
+        cfg = AutoInterpConfig(...)
+        interp = AutoInterp(cfg)
+        interp.run(job_id=0, total_jobs=32, top_k=100, save_dir=Path(...))
+    """
+
+    def __init__(self, cfg: AutoInterpConfig) -> None:
+        self.cfg = cfg
+        self.device = torch.device(cfg.device)
+        self.ctx = cfg.context_size
+
+        patch_official_model_names()
+        patch_convert_hf_model_config()
+
+        self.model = load_model(
+            cfg.model_class_name,
+            cfg.model_name,
+            device=self.device,
+            model_from_pretrained_kwargs=cfg.model_from_pretrained_kwargs,
+        )
+
+        # CLT stays on CPU; only the feature subset is moved to GPU per job.
+        self.clt = CLT.load_from_pretrained(cfg.clt_path, "cpu")
+
+        self.activations_store = ActivationsStore(
+            self.model,
+            cfg,
+            estimated_norm_scaling_factor_in=self.clt.estimated_norm_scaling_factor_in,
+            estimated_norm_scaling_factor_out=self.clt.estimated_norm_scaling_factor_out,
+        )
+        # ActivationsStore defaults to return_tokens=False (yields 2-tuples).
+        # We need the token ids alongside activations, so enable it here.
+        self.activations_store.return_tokens = True
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    def run(
+        self,
+        *,
+        job_id: int,
+        total_jobs: int,
+        top_k: int = TOP_K_DEFAULT,
+        save_dir: Optional[Path] = None,
+        generate_explanations: bool = False,
+    ) -> None:
+        """
+        Run the full pipeline for one job (= one feature slice).
+
+        Args:
+            job_id:               Index of this job in [0, total_jobs).
+            total_jobs:           Total number of parallel jobs.
+            top_k:                Number of top-activating sequences per feature.
+            save_dir:             Root output directory.
+            generate_explanations: If True, run vLLM to generate explanations.
+        """
+        if save_dir is None:
+            if self.cfg.latent_cache_path is None:
+                raise ValueError(
+                    "Either pass save_dir or set cfg.latent_cache_path."
+                )
+            save_dir = Path(self.cfg.latent_cache_path)
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        index_list = self._compute_index_list(job_id, total_jobs)
+        logger.info(
+            f"[Job {job_id}/{total_jobs}] features {index_list[0]}–{index_list[-1]}"
+            f" ({len(index_list)} total)"
+        )
+
+        run_dtype = DTYPE_MAP[self.cfg.dtype]
+        self._prepare_encoder_subset(index_list=index_list, dtype=run_dtype)
+
+        state = self._stream_and_build_topk(top_k=top_k, run_dtype=run_dtype)
+
+        logger.info(f"[Job {job_id}] Building feature dictionaries…")
+        feature_dicts_by_layer = self._state_to_feature_dicts(
+            state=state, index_list=index_list, top_k=top_k
+        )
+
+        self._save_feature_dicts(
+            feature_dicts_by_layer=feature_dicts_by_layer,
+            job_id=job_id,
+            save_dir=save_dir,
+        )
+
+        if generate_explanations:
+            logger.info(f"[Job {job_id}] Generating LLM explanations…")
+            self._generate_and_add_explanations(
+                feature_dicts_by_layer=feature_dicts_by_layer,
+                job_id=job_id,
+                save_dir=save_dir,
+            )
+
+        logger.info(f"[Job {job_id}] Done.")
+
+    # ------------------------------------------------------------------
+    # Feature index computation
+    # ------------------------------------------------------------------
+
+    def _compute_index_list(self, job_id: int, total_jobs: int) -> List[int]:
+        d_latent = self.clt.d_latent
+        per_job = d_latent // total_jobs
+        start = job_id * per_job
+        end = start + per_job if job_id < total_jobs - 1 else d_latent
+        return list(range(start, end))
+
+    # ------------------------------------------------------------------
+    # Encoder subset — slice CTL params for index_list, load onto GPU
+    # ------------------------------------------------------------------
+
+    def _prepare_encoder_subset(
+        self, *, index_list: List[int], dtype: torch.dtype
+    ) -> None:
+        idx = torch.as_tensor(index_list, dtype=torch.long)
+        self._index_list = list(index_list)
+        self._W_enc_sub = self.clt.W_enc[:, :, idx].to(
+            self.device, dtype=dtype, non_blocking=True
+        )  # [L, d_in, F]
+        self._b_enc_sub = self.clt.b_enc[:, idx].to(
+            self.device, dtype=dtype, non_blocking=True
+        )  # [L, F]
+        self._threshold_sub = torch.exp(self.clt.log_threshold[:, idx]).to(
+            self.device, dtype=dtype, non_blocking=True
+        )  # [L, F]
+        self._bandwidth = self.clt.bandwidth
+
+    @torch.no_grad()
+    def _encode_subset(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [B, L, d_in] → [B, L, F]  (all on GPU)"""
+        hidden_pre = (
+            torch.einsum("bld,ldf->blf", x, self._W_enc_sub) + self._b_enc_sub
+        )
+        return JumpReLU.apply(hidden_pre, self._threshold_sub, self._bandwidth)
+
+    # ------------------------------------------------------------------
+    # Single-pass streaming + top-K accumulation
+    # ------------------------------------------------------------------
+
+    def _stream_and_build_topk(
+        self, *, top_k: int, run_dtype: torch.dtype
+    ) -> Dict[str, Any]:
+        """One pass over the data: encode and accumulate per-feature top-K."""
+        state: Optional[Dict[str, Any]] = None
+        n_tokens = 0
+        iterator = iter(self.activations_store)
+        log_every = max(1, self.cfg.total_autointerp_tokens // 20)
+
+        while n_tokens < self.cfg.total_autointerp_tokens:
+            tokens_cpu, acts_in, _ = next(iterator)
+            x = acts_in.to(self.device, dtype=run_dtype)
+
+            with torch.no_grad():
+                feat_act = self._encode_subset(x)  # [B, L, F]
+
+            tokens_seq, acts_seq = self._to_sequences(tokens_cpu, feat_act)
+            n_tokens += int(feat_act.shape[0])
+
+            if tokens_seq.shape[0] > 0:
+                if state is None:
+                    state = self._init_topk_state(
+                        n_layers=int(acts_seq.shape[2]),
+                        F=len(self._index_list),
+                        top_k=top_k,
+                        ctx=self.ctx,
+                        dtype=run_dtype,
+                        device=self.device,
+                    )
+                self._update_state(
+                    state=state,
+                    tokens_seq=tokens_seq,
+                    acts_seq=acts_seq,
+                    top_k=top_k,
+                )
+
+            del x, feat_act, acts_seq
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            if n_tokens % log_every < self.cfg.train_batch_size_tokens:
+                logger.info(
+                    f"  {n_tokens:,} / {self.cfg.total_autointerp_tokens:,} tokens"
+                )
+
+        if state is None:
+            raise RuntimeError("No data was processed — check ActivationsStore setup.")
+        return state
+
+    def _to_sequences(
+        self, tokens_cpu: torch.Tensor, feat_act_gpu: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Reshape flat token/activation arrays into context-sized sequences.
+
+        tokens_cpu:   [B]          (CPU)
+        feat_act_gpu: [B, L, F]   (GPU)
+
+        returns:
+            tokens_seq: [B_seq, ctx]        (CPU)
+            acts_seq:   [B_seq, ctx, L, F]  (GPU)
+        """
+        B = int(feat_act_gpu.shape[0])
+        excess = B % self.ctx
+        if excess:
+            feat_act_gpu = feat_act_gpu[:-excess]
+            tokens_cpu = tokens_cpu[:-excess]
+            B -= excess
+
+        if B == 0:
+            L, F = feat_act_gpu.shape[1], feat_act_gpu.shape[2]
+            return (
+                tokens_cpu.new_zeros((0, self.ctx)),
+                feat_act_gpu.new_zeros((0, self.ctx, L, F)),
+            )
+
+        B_seq = B // self.ctx
+        tokens_seq = tokens_cpu.view(B_seq, self.ctx)
+        acts_seq = feat_act_gpu.view(
+            B_seq, self.ctx, feat_act_gpu.shape[1], feat_act_gpu.shape[2]
+        )
+        return tokens_seq, acts_seq
+
+    @staticmethod
+    def _init_topk_state(
+        *,
+        n_layers: int,
+        F: int,
+        top_k: int,
+        ctx: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Dict[str, Any]:
+        neg_inf = torch.full((top_k, F), float("-inf"), device=device, dtype=dtype)
+        tok_zero = torch.zeros((top_k, F, ctx), device=device, dtype=torch.int32)
+        act_zero = torch.zeros((top_k, F, ctx), device=device, dtype=dtype)
+        return {
+            "top_vals":   [neg_inf.clone() for _ in range(n_layers)],
+            "top_tokens": [tok_zero.clone() for _ in range(n_layers)],
+            "top_acts":   [act_zero.clone() for _ in range(n_layers)],
+            "sum_pos":    [torch.zeros(F, device=device, dtype=dtype) for _ in range(n_layers)],
+            "count_pos":  [torch.zeros(F, device=device, dtype=torch.long) for _ in range(n_layers)],
+        }
+
+    @torch.no_grad()
+    def _update_state(
+        self,
+        *,
+        state: Dict[str, Any],
+        tokens_seq: torch.Tensor,  # [B_seq, ctx]      CPU
+        acts_seq: torch.Tensor,    # [B_seq, ctx, L, F] GPU
+        top_k: int,
+    ) -> None:
+        B_seq = int(tokens_seq.shape[0])
+        if B_seq == 0:
+            return
+
+        tokens_gpu = tokens_seq.to(self.device, dtype=torch.int32)
+        L = int(acts_seq.shape[2])
+        F = int(acts_seq.shape[3])
+        ctx = int(acts_seq.shape[1])
+
+        # Broadcast token sequence across all F features: [B_seq, F, ctx]
+        batch_tokens = tokens_gpu[:, None, :].expand(B_seq, F, ctx).contiguous()
+
+        for layer in range(L):
+            # [B_seq, F, ctx]
+            batch_acts = acts_seq[:, :, layer, :].permute(0, 2, 1).contiguous()
+            # [B_seq, F] — max activation per sequence per feature
+            batch_vals = batch_acts.max(dim=2).values
+
+            # Running stats (for average activation computation)
+            pos = batch_vals > 0
+            state["sum_pos"][layer].add_((batch_vals * pos).sum(dim=0))
+            state["count_pos"][layer].add_(pos.sum(dim=0))
+
+            # Merge batch with current top-K, keep top-K
+            merged_vals   = torch.cat([state["top_vals"][layer],   batch_vals  ], dim=0)  # [K+B, F]
+            merged_tokens = torch.cat([state["top_tokens"][layer], batch_tokens], dim=0)  # [K+B, F, ctx]
+            merged_acts   = torch.cat([state["top_acts"][layer],   batch_acts  ], dim=0)  # [K+B, F, ctx]
+
+            new_vals, sel = torch.topk(merged_vals, k=top_k, dim=0)   # [K, F]
+            gather_idx = sel[:, :, None].expand(top_k, F, ctx)        # [K, F, ctx]
+
+            state["top_vals"][layer]   = new_vals
+            state["top_tokens"][layer] = torch.gather(merged_tokens, 0, gather_idx)
+            state["top_acts"][layer]   = torch.gather(merged_acts,   0, gather_idx)
+
+        del tokens_gpu, batch_tokens
+
+    # ------------------------------------------------------------------
+    # Build feature dictionaries from accumulated state
+    # ------------------------------------------------------------------
+
+    def _state_to_feature_dicts(
+        self,
+        *,
+        state: Dict[str, Any],
+        index_list: List[int],
+        top_k: int,
+    ) -> List[Dict[str, Dict[str, Any]]]:
+        """
+        Returns a list of length n_layers.
+        Each element is {str(feat_id): feature_dict} for that layer.
+        String keys are used for JSON compatibility.
+        """
+        tokenizer = self.model.tokenizer
+        n_layers = len(state["top_vals"])
+        result: List[Dict[str, Dict[str, Any]]] = [{} for _ in range(n_layers)]
+
+        for layer in range(n_layers):
+            top_vals   = state["top_vals"][layer].cpu()    # [K, F]
+            top_tokens = state["top_tokens"][layer].cpu()  # [K, F, ctx]
+            top_acts   = state["top_acts"][layer].cpu()    # [K, F, ctx]
+            sum_pos    = state["sum_pos"][layer].cpu()     # [F]
+            count_pos  = state["count_pos"][layer].cpu()   # [F]
+
+            for j, feat_id in enumerate(index_list):
+                # Collect non-trivial top sequences (descending order from topk)
+                sequences: List[Dict[str, Any]] = []
+                for k in range(top_k):
+                    v = float(top_vals[k, j])
+                    if v == float("-inf") or v <= 0:
+                        break  # remaining slots are unfilled or zero
+                    sequences.append(
+                        {
+                            "tokens":      top_tokens[k, j],
+                            "activations": top_acts[k, j],
+                            "max_val":     v,
+                        }
+                    )
+
+                top_examples: List[str] = []
+                sequences_serializable: List[Dict[str, Any]] = []
+                for s in sequences:
+                    tks  = s["tokens"][1:]       # drop BOS token
+                    acts = s["activations"][1:]  # drop BOS
+                    top_examples.append(highlight_activations(tks, acts, tokenizer))
+                    sequences_serializable.append(
+                        {
+                            "tokens":      s["tokens"].tolist(),
+                            "activations": s["activations"].tolist(),
+                            "max_val":     float(s["max_val"]),
+                        }
+                    )
+
+                c = int(count_pos[j])
+                avg_activation = float(sum_pos[j]) / c if c > 0 else 0.0
+
+                result[layer][str(feat_id)] = {
+                    "layer":                 int(layer),
+                    "feature_index":         int(feat_id),
+                    "average_activation":    avg_activation,
+                    "top_examples":          top_examples,
+                    "top_examples_tks":      sequences_serializable,
+                    "top_activating_tokens": _get_top_activating_tokens(
+                        sequences=sequences,
+                        tokenizer=tokenizer,
+                        top_k=N_TOP_ACTIVATING_TOKENS_SHOWN,
+                    ),
+                    "description":           "Unknown",
+                    "explanation":           "No explanation generated",
+                    "raw_explanation":       "",
+                }
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Saving
+    # ------------------------------------------------------------------
+
+    def _save_feature_dicts(
+        self,
+        *,
+        feature_dicts_by_layer: List[Dict[str, Dict[str, Any]]],
+        job_id: int,
+        save_dir: Path,
+    ) -> None:
+        """
+        Write one compact JSON per layer per job.
+        Total files = N_jobs × N_layers (e.g. 32 × 12 = 384 for GPT-2).
+        """
+        for layer, layer_dicts in enumerate(feature_dicts_by_layer):
+            layer_dir = save_dir / "features" / f"layer_{layer}"
+            layer_dir.mkdir(parents=True, exist_ok=True)
+            (layer_dir / f"job_{job_id}.json").write_text(
+                json.dumps(layer_dicts, separators=(",", ":"))
+            )
+        logger.info(
+            f"[Job {job_id}] Feature dicts saved under {save_dir / 'features'}"
+        )
+
+    # ------------------------------------------------------------------
+    # Optional LLM explanations
+    # ------------------------------------------------------------------
+
+    def _generate_and_add_explanations(
+        self,
+        *,
+        feature_dicts_by_layer: List[Dict[str, Dict[str, Any]]],
+        job_id: int,
+        save_dir: Path,
+    ) -> None:
+        """
+        For each non-dead feature: build a prompt, batch through vLLM,
+        parse the response, update the in-memory dict, re-save.
+        """
+        from circuitlab.autointerp.client import run_client
+        from circuitlab.autointerp.prompt import generate_prompt
+
+        prompt_dir     = save_dir / "prompts"
+        explanation_dir = save_dir / "explanations"
+        prompt_dir.mkdir(parents=True, exist_ok=True)
+        explanation_dir.mkdir(parents=True, exist_ok=True)
+
+        prompt_paths: List[Path] = []
+        feat_layer_keys: List[Tuple[int, str]] = []
+
+        for layer, layer_dicts in enumerate(feature_dicts_by_layer):
+            for feat_key, feat_dict in layer_dicts.items():
+                if not feat_dict["top_examples"]:
+                    continue  # dead feature — skip
+
+                prompt = generate_prompt(
+                    feat_dict["top_examples"], layer, int(feat_key)
+                )
+                p = prompt_dir / f"job{job_id}_L{layer}_F{feat_key}.txt"
+                p.write_text(prompt)
+                prompt_paths.append(p)
+                feat_layer_keys.append((layer, feat_key))
+
+        if not prompt_paths:
+            logger.info(f"[Job {job_id}] No live features — skipping vLLM.")
+            return
+
+        run_client(
+            prompts=prompt_paths,
+            out_dir=explanation_dir,
+            vllm_model=self.cfg.vllm_model,
+            vllm_max_tokens=self.cfg.vllm_max_tokens,
+        )
+
+        # Patch explanations back into the in-memory dicts
+        for p, (layer, feat_key) in zip(prompt_paths, feat_layer_keys):
+            exp_file = explanation_dir / p.name
+            if not exp_file.exists():
+                continue
+            raw = exp_file.read_text().strip()
+            desc, expl = _parse_explanation(raw)
+            d = feature_dicts_by_layer[layer][feat_key]
+            d["raw_explanation"] = raw
+            d["description"]     = desc
+            d["explanation"]     = expl
+
+        # Re-save with explanations filled in
+        self._save_feature_dicts(
+            feature_dicts_by_layer=feature_dicts_by_layer,
+            job_id=job_id,
+            save_dir=save_dir,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+def highlight_activations(
+    tokens: torch.Tensor,
+    activations: torch.Tensor,
+    tokenizer,
+    threshold_ratio: float = 0.6,
+) -> str:
+    """
+    Build a text string with <<highlighted>> spans around the most active tokens.
+    Handles Chinese text (no word-boundary extension) vs. Latin scripts.
+    """
+    assert len(tokens) == len(activations), "Token/activation length mismatch."
+    if activations.numel() == 0:
+        return ""
+
+    max_act = float(activations.max())
+    if max_act <= 0:
+        return tokenizer.decode(tokens.tolist())
+
+    threshold = max_act * threshold_ratio
+    str_tokens = tokenizer.convert_ids_to_tokens(tokens.tolist())
+    highlight_mask = (activations > threshold).tolist()
+
+    def _contains_chinese(text: str) -> bool:
+        return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+    sample = tokenizer.convert_tokens_to_string(str_tokens[: min(10, len(str_tokens))])
+    is_chinese = _contains_chinese(sample)
+
+    extended = list(highlight_mask)
+    if not is_chinese:
+        WORD_STARTS = {"▁", " ", "Ġ"}
+        SPECIAL = {"<|endoftext|>", "</s>", "<s>", "[CLS]", "[SEP]"}
+        for i in range(len(str_tokens)):
+            if not highlight_mask[i]:
+                continue
+            # Extend backwards to word start
+            j = i - 1
+            while (
+                j >= 0
+                and str_tokens[j][:1] not in WORD_STARTS
+                and str_tokens[j] not in SPECIAL
+            ):
+                extended[j] = True
+                j -= 1
+            # Extend forwards to word end
+            j = i + 1
+            while (
+                j < len(str_tokens)
+                and str_tokens[j][:1] not in WORD_STARTS
+                and str_tokens[j] not in SPECIAL
+            ):
+                extended[j] = True
+                j += 1
+
+    # Build marked token list
+    marked: List[str] = []
+    in_hl = False
+    for tok, hi in zip(str_tokens, extended):
+        if hi and not in_hl:
+            marked.append("<<")
+            in_hl = True
+        elif not hi and in_hl:
+            marked.append(">>")
+            in_hl = False
+        marked.append(tok)
+    if in_hl:
+        marked.append(">>")
+
+    # Merge token subwords back into strings
+    segments: List[str] = []
+    buf: List[str] = []
+    for tok in marked:
+        if tok in {"<<", ">>"}:
+            if buf:
+                segments.append(tokenizer.convert_tokens_to_string(buf))
+                buf = []
+            segments.append(tok)
+        else:
+            buf.append(tok)
+    if buf:
+        segments.append(tokenizer.convert_tokens_to_string(buf))
+
+    # Assemble final string
+    result = ""
+    i = 0
+    while i < len(segments):
+        seg = segments[i]
+        if seg == "<<":
+            if result and not result.endswith(" "):
+                result += " "
+            result += "<<"
+            i += 1
+            if i < len(segments):
+                result += segments[i].lstrip()
+                i += 1
+            if i < len(segments) and segments[i] == ">>":
+                result += ">>"
+                i += 1
+        else:
+            if result and not result.endswith(" "):
+                result += " "
+            result += seg
+            i += 1
+
+    return result
+
+
+def _get_top_activating_tokens(
+    *,
+    sequences: List[Dict[str, Any]],
+    tokenizer,
+    top_k: int = N_TOP_ACTIVATING_TOKENS_SHOWN,
+    threshold_ratio: float = 0.6,
+) -> List[Dict[str, Any]]:
+    """Return the most frequently highly-active tokens across top sequences."""
+    if not sequences:
+        return []
+
+    all_tks  = torch.cat([s["tokens"][1:]      for s in sequences])
+    all_acts = torch.cat([s["activations"][1:] for s in sequences])
+
+    if all_acts.numel() == 0:
+        return []
+
+    thresh = float(all_acts.max()) * threshold_ratio
+    mask = all_acts > thresh
+
+    stats: Dict[int, Dict[str, float]] = {}
+    for tid, act in zip(all_tks[mask].tolist(), all_acts[mask].tolist()):
+        if tid not in stats:
+            stats[tid] = {"count": 0.0, "total": 0.0}
+        stats[tid]["count"] += 1.0
+        stats[tid]["total"] += float(act)
+
+    ranking = [
+        {
+            "token":              tokenizer.decode([int(tid)]),
+            "token_id":           int(tid),
+            "frequency":          int(v["count"]),
+            "average_activation": v["total"] / v["count"],
+        }
+        for tid, v in stats.items()
+    ]
+    ranking.sort(key=lambda x: x["frequency"], reverse=True)
+    return ranking[:top_k]
+
+
+def _parse_explanation(raw: str) -> Tuple[str, str]:
+    """Parse the [DESCRIPTION]: / [EXPLANATION]: response format."""
+    description = "Unknown"
+    explanation = raw
+    for line in raw.splitlines():
+        if line.startswith("[DESCRIPTION]:"):
+            description = line[len("[DESCRIPTION]:"):].strip()
+        elif line.startswith("[EXPLANATION]:"):
+            explanation = line[len("[EXPLANATION]:"):].strip()
+    return description, explanation
