@@ -19,26 +19,26 @@ def main():
     expansion_factor = 32
     d_latent = d_in * expansion_factor
 
-    clt_path = "/fast/fdraye/data/featflow/cache/checkpoints/gpt2/d1s3fw30/middle_22137856"
+    clt_path = "/path/to/clt/checkpoint"
 
     autointerp_cfg = {
         "device": "cuda",  # 👈 NOW GPU matters
         "model_name": "gpt2",
         "clt_path": clt_path,
-        "latent_cache_path": "/fast/fdraye/data/featflow/cache/gpt2",
-        "dataset_path": "apollo-research/Skylion007-openwebtext-tokenizer-gpt2",
+        "latent_cache_path": "/where/to/save/cache",
+        "dataset_path": "Skylion007-openwebtext-tokenizer-gpt2",
         "context_size": 16,
-        "total_autointerp_tokens": 64 * (32 * 4096),
+        "total_autointerp_tokens": 10_000_000,
         "train_batch_size_tokens": 4096,
         "n_batches_in_buffer": 64,
         "store_batch_size_prompts": 64,
         "d_in": d_in,
     }
 
-    print("Creating AutoInterpConfig...", flush=True)
+    print("Creating AutoInterpConfig...")
     cfg = AutoInterpConfig(**autointerp_cfg)
 
-    print("Initializing AutoInterp...", flush=True)
+    print("Initializing AutoInterp...")
     autointerp = AutoInterp(cfg)
 
     features_per_job = d_latent // total_jobs
@@ -49,8 +49,7 @@ def main():
     print(
         f"[Job {job_id}/{total_jobs}] "
         f"Processing features {start_idx} → {end_idx - 1} "
-        f"({len(index_list)} features)",
-        flush=True,
+        f"({len(index_list)} features)"
     )
 
     autointerp.run(
