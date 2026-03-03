@@ -6,7 +6,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # should run on a single GPU
 
 def main():
-    clt_checkpoint = "/fast/fdraye/data/featflow/cache/checkpoints/gpt2/d1s3fw30/middle_22137856"
+    clt_checkpoint = "/path/to/clt/checkpoint"
     model_name = "gpt2"
 
     test_strings = [
