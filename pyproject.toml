@@ -9,7 +9,7 @@ packages = [
 ]
 
 [tool.poetry.dependencies]
-python = "3.11"
+python = ">=3.11,<3.12"
 sae-lens = ">=5.9.1,<6.11.2"
 pydantic = ">=2.11.3,<3.0.0"
 pytest = ">=8.3.5,<9.0.0"

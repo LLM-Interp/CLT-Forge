@@ -10,8 +10,8 @@ if str(project_root / "src") not in sys.path:
 
 import torch
 # Import only CLTConfig directly to avoid wandb dependency
-from clt.config.clt_config import CLTConfig
-from clt.clt import CLT
+from circuitlab.config.clt_config import CLTConfig
+from circuitlab.clt import CLT
 
 
 def test_decoder_type(decoder_type: str, n_layers: int = 4, d_in: int = 64, d_latent: int = 256, decoder_rank: int = 16):
@@ -26,6 +26,7 @@ def test_decoder_type(decoder_type: str, n_layers: int = 4, d_in: int = 64, d_la
         dtype="float32",
         seed=42,
         model_name="test",
+        debug=False,
         d_in=d_in,
         d_latent=d_latent,
         n_layers=n_layers,
@@ -107,6 +108,7 @@ def compare_parameter_efficiency():
             dtype="float32",
             seed=42,
             model_name="test",
+        debug=False,
             d_in=d_in,
             d_latent=d_latent,
             n_layers=n_layers,

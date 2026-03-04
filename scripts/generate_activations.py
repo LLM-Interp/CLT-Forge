@@ -5,10 +5,10 @@ project_root = Path(__file__).parent.parent / "src"
 sys.path.insert(0, str(project_root))
 
 import torch
-from clt.config.clt_training_runner_config import CLTTrainingRunnerConfig
-from clt.transformer_lens.multilingual_patching import patch_official_model_names, patch_convert_hf_model_config
-from clt.training.activations_store import ActivationsStore
-from clt.load_model import load_model
+from circuitlab.config.clt_training_runner_config import CLTTrainingRunnerConfig
+from circuitlab.transformer_lens.multilingual_patching import patch_official_model_names, patch_convert_hf_model_config
+from circuitlab.training.activations_store import ActivationsStore
+from circuitlab.load_model import load_model
 
 
 total_training_steps = 1000

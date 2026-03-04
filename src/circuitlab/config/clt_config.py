@@ -25,6 +25,10 @@ class CLTConfig(BaseModel):
     context_size: int
     functional_loss: Optional[str] = None
 
+    # -----Efficient Decoder Parameterization-----
+    decoder_type: str = "full"
+    decoder_rank: int = 64
+
     # -----Sparsity---------------------------
     l0_coefficient: float
 

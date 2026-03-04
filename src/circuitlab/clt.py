@@ -77,20 +77,60 @@ class CLT(nn.Module):
 
         if cfg.cross_layer_decoders:
             self.N_dec = self.N_layers * (self.N_layers + 1) // 2
-            self.W_dec = nn.Parameter(torch.empty(self.N_dec, self.local_d_latent, self.d_in, dtype=self.dtype, device=init_device))
-            self.b_dec = nn.Parameter(torch.zeros(self.N_dec, self.d_in, dtype=self.dtype, device=init_device))
+            self.N_cross = self.N_layers * (self.N_layers - 1) // 2  # off-diagonal pairs
 
             l_idx, k_idx = torch.triu_indices(self.N_layers, self.N_layers, offset=0,
                                             device=init_device)
-            self.register_buffer('l_idx', l_idx, persistent=False)   # [K]
-            self.register_buffer('k_idx', k_idx, persistent=False)   # [K]
+            self.register_buffer('l_idx', l_idx, persistent=False)   # [N_dec]
+            self.register_buffer('k_idx', k_idx, persistent=False)   # [N_dec]
+
+            # Separate diagonal (l==k) and off-diagonal (l<k) indices
+            diag_mask = (l_idx == k_idx)
+            offdiag_mask = (l_idx < k_idx)
+            self.register_buffer('diag_mask', diag_mask, persistent=False)
+            self.register_buffer('offdiag_mask', offdiag_mask, persistent=False)
+
+            # For off-diagonal terms, which base decoder (source layer) to use
+            offdiag_source_layers = l_idx[offdiag_mask]  # [N_cross]
+            self.register_buffer('offdiag_source_layers', offdiag_source_layers, persistent=False)
+
+            decoder_type = cfg.decoder_type
+            decoder_rank = cfg.decoder_rank
+
+            if decoder_type == "full":
+                self.W_dec = nn.Parameter(torch.empty(self.N_dec, self.local_d_latent, self.d_in, dtype=self.dtype, device=init_device))
+                self.b_dec = nn.Parameter(torch.zeros(self.N_dec, self.d_in, dtype=self.dtype, device=init_device))
+
+            elif decoder_type == "lora":
+                # Base decoders for diagonal (l->l): [N_layers, local_d_latent, d_in]
+                self.W_dec_base = nn.Parameter(torch.empty(self.N_layers, self.local_d_latent, self.d_in, dtype=self.dtype, device=init_device))
+                self.b_dec = nn.Parameter(torch.zeros(self.N_dec, self.d_in, dtype=self.dtype, device=init_device))
+                # Low-rank updates for off-diagonal (l->k where k>l): A @ B
+                self.lora_A = nn.Parameter(torch.empty(self.N_cross, self.local_d_latent, decoder_rank, dtype=self.dtype, device=init_device))
+                self.lora_B = nn.Parameter(torch.empty(self.N_cross, decoder_rank, self.d_in, dtype=self.dtype, device=init_device))
+                self.decoder_rank = decoder_rank
+
+            elif decoder_type == "linear_transform":
+                # Base decoders: [N_layers, local_d_latent, d_in]
+                self.W_dec_base = nn.Parameter(torch.empty(self.N_layers, self.local_d_latent, self.d_in, dtype=self.dtype, device=init_device))
+                self.b_dec = nn.Parameter(torch.zeros(self.N_dec, self.d_in, dtype=self.dtype, device=init_device))
+                # Distance-based transformations: T_left = I + A_left @ B_left
+                self.transform_A_left = nn.Parameter(torch.empty(self.N_layers - 1, self.local_d_latent, decoder_rank, dtype=self.dtype, device=init_device))
+                self.transform_B_left = nn.Parameter(torch.empty(self.N_layers - 1, decoder_rank, self.local_d_latent, dtype=self.dtype, device=init_device))
+                self.decoder_rank = decoder_rank
+                # Compute distance for each off-diagonal pair
+                offdiag_distances = k_idx[offdiag_mask] - l_idx[offdiag_mask] - 1  # 0-indexed
+                self.register_buffer('offdiag_distances', offdiag_distances, persistent=False)
+
+            else:
+                raise ValueError(f"Unknown decoder_type: {decoder_type}")
 
             layer_mask = torch.zeros(self.N_layers, self.N_dec, device=init_device, dtype=self.dtype)
             for layer in range(self.N_layers):
                 layer_mask[layer, l_idx == layer] = 1
             self.register_buffer('layer_mask', layer_mask)
 
-        else: 
+        else:
             self.W_dec = nn.Parameter(torch.empty(self.N_layers, self.local_d_latent, self.d_in, dtype=self.dtype, device=init_device))
             self.b_dec = nn.Parameter(torch.zeros(self.N_layers, self.d_in, dtype=self.dtype, device=init_device))
 
@@ -122,7 +162,22 @@ class CLT(nn.Module):
 
         # decoder: U(-1/(n_layers*d_model), +1/(n_layers*d_model))
         dec_lim = 1.0 / (self.N_layers * self.d_in)**0.5
-        nn.init.uniform_(self.W_dec, -dec_lim, dec_lim)
+        decoder_type = self.cfg.decoder_type
+
+        if decoder_type == "full" or not self.cfg.cross_layer_decoders:
+            nn.init.uniform_(self.W_dec, -dec_lim, dec_lim)
+
+        elif decoder_type == "lora":
+            nn.init.uniform_(self.W_dec_base, -dec_lim, dec_lim)
+            lora_lim = 1.0 / (self.decoder_rank ** 0.5)
+            nn.init.uniform_(self.lora_A, -lora_lim, lora_lim)
+            nn.init.zeros_(self.lora_B)  # Start with zero contribution from LoRA
+
+        elif decoder_type == "linear_transform":
+            nn.init.uniform_(self.W_dec_base, -dec_lim, dec_lim)
+            transform_lim = 1.0 / (self.decoder_rank ** 0.5)
+            nn.init.uniform_(self.transform_A_left, -transform_lim, transform_lim)
+            nn.init.zeros_(self.transform_B_left)  # Start with identity transform
 
     def _initialize_b_enc(self, hidden_pre: Float[torch.Tensor, "..."]) -> None: 
         """
@@ -168,6 +223,59 @@ class CLT(nn.Module):
             
             # print(f"Actual average activation rate: {avg_activation_rate * self.d_latent:.0f}")
             # print(f"Expected ~{self.d_latent * target_activation_rate:.0f} ")
+
+    def _get_effective_W_dec(self) -> torch.Tensor:
+        """
+        Compute the effective decoder weight matrix from efficient parameterization.
+        Returns: [N_dec, local_d_latent, d_in] for cross-layer, [N_layers, local_d_latent, d_in] otherwise
+        """
+        if not self.cfg.cross_layer_decoders:
+            return self.W_dec
+
+        decoder_type = self.cfg.decoder_type
+
+        if decoder_type == "full":
+            return self.W_dec
+
+        elif decoder_type == "lora":
+            W_dec_full = torch.zeros(self.N_dec, self.local_d_latent, self.d_in,
+                                     dtype=self.dtype, device=self.W_dec_base.device)
+
+            # Fill diagonal terms directly from base
+            diag_indices = self.diag_mask.nonzero(as_tuple=True)[0]
+            for i, dec_idx in enumerate(diag_indices):
+                W_dec_full[dec_idx] = self.W_dec_base[i]
+
+            # Fill off-diagonal terms: base + LoRA
+            offdiag_indices = self.offdiag_mask.nonzero(as_tuple=True)[0]
+            for i, dec_idx in enumerate(offdiag_indices):
+                source_layer = self.offdiag_source_layers[i]
+                lora_update = self.lora_A[i] @ self.lora_B[i]  # [local_d_latent, d_in]
+                W_dec_full[dec_idx] = self.W_dec_base[source_layer] + lora_update
+
+            return W_dec_full
+
+        elif decoder_type == "linear_transform":
+            W_dec_full = torch.zeros(self.N_dec, self.local_d_latent, self.d_in,
+                                     dtype=self.dtype, device=self.W_dec_base.device)
+
+            # Fill diagonal terms directly from base
+            diag_indices = self.diag_mask.nonzero(as_tuple=True)[0]
+            for i, dec_idx in enumerate(diag_indices):
+                W_dec_full[dec_idx] = self.W_dec_base[i]
+
+            # Fill off-diagonal terms: T @ base where T = I + A @ B
+            offdiag_indices = self.offdiag_mask.nonzero(as_tuple=True)[0]
+            for i, dec_idx in enumerate(offdiag_indices):
+                source_layer = self.offdiag_source_layers[i]
+                d = self.offdiag_distances[i]
+                transform = self.transform_A_left[d] @ self.transform_B_left[d]  # [local_d_latent, local_d_latent]
+                W_dec_full[dec_idx] = self.W_dec_base[source_layer] + transform @ self.W_dec_base[source_layer]
+
+            return W_dec_full
+
+        else:
+            raise ValueError(f"Unknown decoder_type: {decoder_type}")
 
     def encode(
         self,
@@ -223,7 +331,9 @@ class CLT(nn.Module):
                 B = z.shape[0]
                 z_sel = z.index_select(1, self.l_idx)  # select source layers
 
-                contrib = torch.einsum('bkd,kdf->bkf', z_sel, self.W_dec)  # [B, N_dec, d_in]
+                # Get effective decoder weights (handles full/lora/linear_transform)
+                W_dec_eff = self._get_effective_W_dec()  # [N_dec, local_d_latent, d_in]
+                contrib = torch.einsum('bkd,kdf->bkf', z_sel, W_dec_eff)  # [B, N_dec, d_in]
 
                 out = torch.zeros(B, self.N_layers, self.d_in, dtype=contrib.dtype, device=contrib.device)
                 out = out.index_add(1, self.k_idx, contrib)
@@ -231,7 +341,7 @@ class CLT(nn.Module):
                 if self.cfg.is_sharded: # ideally only used for training
                     out = out.contiguous()
                     out = all_reduce(out, op=dist.ReduceOp.SUM)
-                
+
                 # Add bias after aggregation (not inside sharded block)
                 b_contrib = torch.zeros(1, self.N_layers, self.d_in, dtype=contrib.dtype, device=contrib.device)
                 b_contrib = b_contrib.index_add(1, self.k_idx, self.b_dec.unsqueeze(0))
@@ -239,11 +349,11 @@ class CLT(nn.Module):
 
             else:
                 out = torch.einsum("bnk,nkd->bnd", z, self.W_dec)  # [B, N_layers, d_in]
-                
+
                 if self.cfg.is_sharded:
                     out = out.contiguous()
                     out = all_reduce(out, op=dist.ReduceOp.SUM)
-                
+
                 # Add bias after aggregation (not inside sharded block)
                 out = out + self.b_dec.to(out.dtype).unsqueeze(0)
 
@@ -251,9 +361,11 @@ class CLT(nn.Module):
             # Layer-specific decode
             assert 0 <= layer < self.N_layers, f"Layer {layer} out of range"
             if self.cfg.cross_layer_decoders:
+                # Get effective decoder weights (handles full/lora/linear_transform)
+                W_dec_eff = self._get_effective_W_dec()  # [N_dec, local_d_latent, d_in]
                 indices = (self.l_idx == layer).nonzero(as_tuple=True)[0]
                 z_layer = z.unsqueeze(1).expand(-1, len(indices), -1)
-                W_dec_layer = self.W_dec[indices]
+                W_dec_layer = W_dec_eff[indices]
                 b_dec_layer = self.b_dec[indices]
                 out = torch.einsum('bkd,kdf->bkf', z_layer, W_dec_layer) + b_dec_layer
             else:
@@ -307,9 +419,10 @@ class CLT(nn.Module):
         mse_loss = mse_loss_accross_layers.sum()
         
         if self.cfg.cross_layer_decoders:
-            squared_norms = (self.W_dec.float()**2).sum(dim=2)
-            feature_norms_local = torch.sqrt(torch.matmul(self.layer_mask.float(), squared_norms)) 
-        else: 
+            W_dec_eff = self._get_effective_W_dec()  # handles full/lora/linear_transform
+            squared_norms = (W_dec_eff.float()**2).sum(dim=2)
+            feature_norms_local = torch.sqrt(torch.matmul(self.layer_mask.float(), squared_norms))
+        else:
             feature_norms_local = self.W_dec.float().norm(dim=2)
         
         # Compute L0 loss local
@@ -357,19 +470,30 @@ class CLT(nn.Module):
         )
 
     def log_loss_debug(
-        self, 
+        self,
         feat_act,
         feature_norms_local,
         l0_loss,
     ):
+        decoder_type = self.cfg.decoder_type
+        if decoder_type == "full" or not self.cfg.cross_layer_decoders:
+            dec_info = (
+                f"W_dec shape={tuple(self.W_dec.shape)} | "
+                f"W_dec.requires_grad={self.W_dec.requires_grad} | "
+                f"W_dec has_grad={self.W_dec.grad is not None}"
+            )
+        else:
+            dec_info = (
+                f"decoder_type={decoder_type} | "
+                f"W_dec_base shape={tuple(self.W_dec_base.shape)} | "
+                f"W_dec_base.requires_grad={self.W_dec_base.requires_grad}"
+            )
         logger.info(
             f"Rank {self.rank} | "
             f"feat_act shape={tuple(feat_act.shape)} | "
             f"feature_norms shape={tuple(feature_norms_local.shape)} | "
-            f"W_dec shape={tuple(self.W_dec.shape)} | "
-            f"W_dec.requires_grad={self.W_dec.requires_grad} | "
+            f"{dec_info} | "
             f"feature_norms.requires_grad={feature_norms_local.requires_grad} | "
-            f"W_dec has_grad={self.W_dec.grad is not None} | "
             f"L0 loss={l0_loss.item():.6f}"
         )
         
@@ -401,7 +525,52 @@ class CLT(nn.Module):
 
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self):
-        self.W_dec.data /= torch.norm(self.W_dec.data, dim=2, keepdim=True)
+        decoder_type = self.cfg.decoder_type
+        if decoder_type == "full" or not self.cfg.cross_layer_decoders:
+            self.W_dec.data /= torch.norm(self.W_dec.data, dim=2, keepdim=True)
+        elif decoder_type in ("lora", "linear_transform"):
+            self.W_dec_base.data /= torch.norm(self.W_dec_base.data, dim=2, keepdim=True)
+
+    def get_decoder_param_count(self) -> dict:
+        """
+        Returns parameter counts for decoder weights.
+        Useful for comparing efficiency of different decoder_type options.
+        """
+        decoder_type = self.cfg.decoder_type
+        counts = {"decoder_type": decoder_type}
+
+        if not self.cfg.cross_layer_decoders:
+            counts["W_dec"] = self.W_dec.numel()
+            counts["b_dec"] = self.b_dec.numel()
+            counts["total"] = counts["W_dec"] + counts["b_dec"]
+            return counts
+
+        if decoder_type == "full":
+            counts["W_dec"] = self.W_dec.numel()
+            counts["b_dec"] = self.b_dec.numel()
+            counts["total"] = counts["W_dec"] + counts["b_dec"]
+
+        elif decoder_type == "lora":
+            counts["W_dec_base"] = self.W_dec_base.numel()
+            counts["lora_A"] = self.lora_A.numel()
+            counts["lora_B"] = self.lora_B.numel()
+            counts["b_dec"] = self.b_dec.numel()
+            counts["total"] = counts["W_dec_base"] + counts["lora_A"] + counts["lora_B"] + counts["b_dec"]
+            full_W_dec_count = self.N_dec * self.local_d_latent * self.d_in
+            counts["full_W_dec_equivalent"] = full_W_dec_count
+            counts["compression_ratio"] = full_W_dec_count / (counts["W_dec_base"] + counts["lora_A"] + counts["lora_B"])
+
+        elif decoder_type == "linear_transform":
+            counts["W_dec_base"] = self.W_dec_base.numel()
+            counts["transform_A_left"] = self.transform_A_left.numel()
+            counts["transform_B_left"] = self.transform_B_left.numel()
+            counts["b_dec"] = self.b_dec.numel()
+            counts["total"] = counts["W_dec_base"] + counts["transform_A_left"] + counts["transform_B_left"] + counts["b_dec"]
+            full_W_dec_count = self.N_dec * self.local_d_latent * self.d_in
+            counts["full_W_dec_equivalent"] = full_W_dec_count
+            counts["compression_ratio"] = full_W_dec_count / (counts["W_dec_base"] + counts["transform_A_left"] + counts["transform_B_left"])
+
+        return counts
 
     @classmethod
     def load_from_pretrained(cls, path: Union[str, Path], device: str = "cpu") -> "CLT":
@@ -492,7 +661,22 @@ def _load_full_sharded_clt(path: Union[str, Path], device: str = "cpu") -> "CLT"
     full_sd = {}
     full_sd["W_enc"] = torch.cat([s.W_enc.data for s in shards], dim=2)
     full_sd["b_enc"] = torch.cat([s.b_enc.data for s in shards], dim=1)
-    full_sd["W_dec"] = torch.cat([s.W_dec.data for s in shards], dim=1)
+
+    decoder_type = cfg_dict.get("decoder_type", "full")
+    if decoder_type == "full":
+        full_sd["W_dec"] = torch.cat([s.W_dec.data for s in shards], dim=1)
+    elif decoder_type == "lora":
+        full_sd["W_dec_base"] = torch.cat([s.W_dec_base.data for s in shards], dim=1)
+        full_sd["lora_A"] = torch.cat([s.lora_A.data for s in shards], dim=1)
+        # lora_B is sharded on dim=0 of the latent, but shaped [N_cross, rank, d_in]
+        # The sharding splits local_d_latent, but lora_B doesn't have a d_latent dim to cat on
+        # lora_B should be replicated across ranks since it maps rank -> d_in
+        full_sd["lora_B"] = shards[0].lora_B.data
+    elif decoder_type == "linear_transform":
+        full_sd["W_dec_base"] = torch.cat([s.W_dec_base.data for s in shards], dim=1)
+        full_sd["transform_A_left"] = torch.cat([s.transform_A_left.data for s in shards], dim=1)
+        full_sd["transform_B_left"] = torch.cat([s.transform_B_left.data for s in shards], dim=2)
+
     full_sd["b_dec"] = shards[0].b_dec.data  # replicated
     full_sd["log_threshold"] = torch.cat(
         [s.log_threshold.data for s in shards], dim=1

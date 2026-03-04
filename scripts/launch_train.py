@@ -10,8 +10,8 @@ if str(data_root) not in sys.path:
 
 import torch
 import torch.distributed as dist
-from clt.config.clt_training_runner_config import CLTTrainingRunnerConfig
-from clt.clt_training_runner import CLTTrainingRunner
+from circuitlab.config.clt_training_runner_config import CLTTrainingRunnerConfig
+from circuitlab.clt_training_runner import CLTTrainingRunner
 import wandb
 
 def main():

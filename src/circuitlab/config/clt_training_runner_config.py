@@ -36,7 +36,11 @@ class CLTTrainingRunnerConfig(BaseModel):
     jumprelu_init_threshold: float = 0.03
     jumprelu_bandwidth: float = 1.
     normalize_decoder: bool = False
-    
+
+    # -----Efficient Decoder Parameterization-----
+    decoder_type: str = "full"
+    decoder_rank: int = 64
+
     # -----ActivationStore Parameters---------
     context_size: int = 32
     n_batches_in_buffer: int = 20 # buffer_size = n_batches_in_buffer * store_batch_size_prompts * context_size (for on the fly loading)
@@ -142,6 +146,15 @@ class CLTTrainingRunnerConfig(BaseModel):
             )
         return v
     
+    @field_validator("decoder_type", mode="before")
+    def validate_decoder_type(cls, v: str) -> str:
+        valid_types = ["full", "lora", "linear_transform"]
+        if v not in valid_types:
+            raise ValueError(
+                f"Invalid decoder_type '{v}'. Must be one of {valid_types}."
+            )
+        return v
+
     @field_validator("device", mode="before")
     def fallback_to_cpu(cls, v: str) -> str:
         if v.lower().startswith("cuda") and not torch.cuda.is_available():
