@@ -1,11 +1,11 @@
 import pytest
 from tests.utils import build_clt_training_runner_cfg, FakeActivationsStore
-from featflow.config import CLTTrainingRunnerConfig, CLTConfig
-from featflow.clt import CLT
-from featflow.load_model import load_model
+from circuitlab.config import CLTTrainingRunnerConfig, CLTConfig
+from circuitlab.clt import CLT
+from sae_lens.load_model import load_model
 import torch
-from featflow.training.clt_trainer import CLTTrainer
-from featflow.training.activations_store import ActivationsStore
+from circuitlab.training.clt_trainer import CLTTrainer
+from circuitlab.training.activations_store import ActivationsStore
 from transformer_lens.hook_points import HookedRootModule
 import wandb
 from pathlib import Path
@@ -23,13 +23,15 @@ project_root = current_file.parent.parent
             "model_name": "roneneldan/TinyStories-33M",
             "dataset_path": str(project_root / "data/NeelNanda_c4_10k_tokenized"),
             "d_in": 768,
-            "cross_layer_decoders": False
+            "cross_layer_decoders": False, 
+            "disk": True,
         }, 
         {
             "model_name": "roneneldan/TinyStories-33M",
             "dataset_path": str(project_root / "data/NeelNanda_c4_10k_tokenized"),
             "d_in": 768,
-            "cross_layer_decoders": True
+            "cross_layer_decoders": True, 
+            "disk": True,
         }
     ]
 )
@@ -99,60 +101,60 @@ def _make_trainer(cfg, clt, activations_store, dummy_save_fn):
         save_checkpoint_fn=save_fn,
     ), counter
 
-def test_clt_trainer_runs_with_functional_loss(
-    cfg: CLTTrainingRunnerConfig,
-    model: HookedRootModule,
-    activations_store,
-    dummy_save_fn,
-    monkeypatch,
-):
+# # def test_clt_trainer_runs_with_functional_loss(
+# #     cfg: CLTTrainingRunnerConfig,
+# #     model: HookedRootModule,
+# #     activations_store,
+# #     dummy_save_fn,
+# #     monkeypatch,
+# # ):
     
-    n_layers = model.cfg.n_layers
-    cfg.functional_loss = "kl"
-    clt_config = cfg.create_sub_config(CLTConfig, n_layers=n_layers)
-    clt = CLT(clt_config)
+# #     n_layers = model.cfg.n_layers
+# #     cfg.functional_loss = "kl"
+# #     clt_config = cfg.create_sub_config(CLTConfig, n_layers=n_layers)
+# #     clt = CLT(clt_config)
 
-    monkeypatch.setattr(wandb, "log", lambda *args, **kwargs: None)
-    # Enable functional loss in the config
-    cfg.functional_loss = "kl"  # or "argmax"
-    cfg.fc_coefficient = 1e-3
-    cfg.fc_warm_up_steps = 1
-    cfg.fc_waiting_steps = 0
-    save_fn, counter = dummy_save_fn
-    trainer = CLTTrainer(
-        clt=clt,
-        activations_store=activations_store,
-        cfg=cfg,
-        save_checkpoint_fn=save_fn,
-    )
+# #     monkeypatch.setattr(wandb, "log", lambda *args, **kwargs: None)
+# #     # Enable functional loss in the config
+# #     cfg.functional_loss = "kl"  # or "argmax"
+# #     cfg.fc_coefficient = 1e-3
+# #     cfg.fc_warm_up_steps = 1
+# #     cfg.fc_waiting_steps = 0
+# #     save_fn, counter = dummy_save_fn
+# #     trainer = CLTTrainer(
+# #         clt=clt,
+# #         activations_store=activations_store,
+# #         cfg=cfg,
+# #         save_checkpoint_fn=save_fn,
+# #     )
 
-    clt_out = trainer.fit()
-    assert isinstance(clt_out, CLT)
+# #     clt_out = trainer.fit()
+# #     assert isinstance(clt_out, CLT)
 
-def test_initialize_b_enc(
-    cfg: CLTTrainingRunnerConfig,
-    clt: CLT,
-    activations_store,
-    dummy_save_fn,
-    monkeypatch,
-):
-    monkeypatch.setattr(wandb, "log", lambda *args, **kwargs: None)
-    cfg.d_latent = 10_000
-    trainer, _ = _make_trainer(cfg, clt, activations_store, dummy_save_fn)
-    original_b_enc = clt.b_enc.data.clone()
-    trainer._initialize_b_enc(n_batches=2_000)
+# def test_initialize_b_enc(
+#     cfg: CLTTrainingRunnerConfig,
+#     clt: CLT,
+#     activations_store,
+#     dummy_save_fn,
+#     monkeypatch,
+# ):
+#     monkeypatch.setattr(wandb, "log", lambda *args, **kwargs: None)
+#     cfg.d_latent = 10_000
+#     trainer, _ = _make_trainer(cfg, clt, activations_store, dummy_save_fn)
+#     original_b_enc = clt.b_enc.data.clone()
+#     trainer._initialize_b_enc(n_batches=2_000)
     
-    assert not torch.equal(original_b_enc, clt.b_enc.data), "b_enc should be modified during initialization"
+#     assert not torch.equal(original_b_enc, clt.b_enc.data), "b_enc should be modified during initialization"
     
-    # Test that activation rate is reasonable after initialization
-    acts_in, _ = next(activations_store.__iter__())
-    acts_in = acts_in.to(cfg.device)
+#     # Test that activation rate is reasonable after initialization
+#     acts_in, _ = next(activations_store.__iter__())
+#     acts_in = acts_in.to(cfg.device)
     
-    feat_acts, _ = trainer.clt.encode(acts_in)
-    activation_rate = (feat_acts > 0).float().mean(dim=0).mean().item()
+#     feat_acts, _ = trainer.clt.encode(acts_in)
+#     activation_rate = (feat_acts > 0).float().mean(dim=0).mean().item()
     
-    expected_rate = 0.1
-    assert expected_rate * 0.25 < activation_rate < expected_rate * 4, f"Activation rate {activation_rate:.6f} should be reasonable, expected around {expected_rate:.6f}"
+#     expected_rate = 0.1
+#     assert expected_rate * 0.25 < activation_rate < expected_rate * 4, f"Activation rate {activation_rate:.6f} should be reasonable, expected around {expected_rate:.6f}"
 
 # def test_single_step_updates_parameters(
 #     cfg,

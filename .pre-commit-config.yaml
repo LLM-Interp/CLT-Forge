@@ -11,8 +11,13 @@ repos:
     hooks:
       - id: ruff
         args: ["--fix", "--ignore=E741"]
+        exclude: ^src/circuitlab/transformer_lens/
+
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.9.0
     hooks:
       - id: mypy
-        args: ["--ignore-missing-imports"]
+        args:
+          - --ignore-missing-imports
+          - --config-file=pyproject.toml
+        exclude: ^src/circuitlab/transformer_lens/

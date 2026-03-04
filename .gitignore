@@ -1,3 +1,4 @@
+## No personal stuff in there, should be in .git/info/exclude
 # ruff
 .ruff_cache
 
@@ -11,15 +12,12 @@ checkpoints/
 # poetry
 poetry.lock
 
-# poetry
-pyproject.toml
-
 # logs
 logs/
 **/logs/
 
 # test 
-tests/ckpts_ddp/
+tests/data
 
 # cache
 cache/ 
@@ -30,8 +28,21 @@ __pycache__/
 save/
 **/save/
 
+# cluster
+**/cluster/
+
 # claude
 CLAUDE.md
 
 # data
 data/
+
+# Byte-compiled 
+__pycache__/
+
+# Distribution
+.Python
+eggs/
+.eggs/
+*.egg-info/
+*.egg
