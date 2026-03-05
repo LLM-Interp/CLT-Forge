@@ -58,6 +58,8 @@ class CLTTrainingRunnerConfig(BaseModel):
     decay_stable_steps: int = 0
     final_lr_scale: float = 0.0
     cross_layer_decoders: bool = True
+    decoder_type: str = "full"
+    decoder_rank: int = 64
     lr_warm_up_type: str = "cosine"
 
     # ------Functional Loss------------------

@@ -77,13 +77,42 @@ class CLT(nn.Module):
 
         if cfg.cross_layer_decoders:
             self.N_dec = self.N_layers * (self.N_layers + 1) // 2
-            self.W_dec = nn.Parameter(torch.empty(self.N_dec, self.local_d_latent, self.d_in, dtype=self.dtype, device=init_device))
-            self.b_dec = nn.Parameter(torch.zeros(self.N_dec, self.d_in, dtype=self.dtype, device=init_device))
 
             l_idx, k_idx = torch.triu_indices(self.N_layers, self.N_layers, offset=0,
                                             device=init_device)
-            self.register_buffer('l_idx', l_idx, persistent=False)   # [K]
-            self.register_buffer('k_idx', k_idx, persistent=False)   # [K]
+            self.register_buffer('l_idx', l_idx, persistent=False)   # [N_dec]
+            self.register_buffer('k_idx', k_idx, persistent=False)   # [N_dec]
+
+            decoder_type = cfg.decoder_type
+
+            if decoder_type == "full":
+                self.W_dec = nn.Parameter(torch.empty(self.N_dec, self.local_d_latent, self.d_in, dtype=self.dtype, device=init_device))
+                self.b_dec = nn.Parameter(torch.zeros(self.N_dec, self.d_in, dtype=self.dtype, device=init_device))
+
+            elif decoder_type == "lora":
+                self.N_cross = self.N_layers * (self.N_layers - 1) // 2  # off-diagonal pairs
+
+                # Separate diagonal (l==k) and off-diagonal (l<k) indices
+                diag_mask = (l_idx == k_idx)
+                offdiag_mask = (l_idx < k_idx)
+                self.register_buffer('diag_mask', diag_mask, persistent=False)
+                self.register_buffer('offdiag_mask', offdiag_mask, persistent=False)
+
+                # For off-diagonal terms, which base decoder (source layer) to use
+                offdiag_source_layers = l_idx[offdiag_mask]  # [N_cross]
+                self.register_buffer('offdiag_source_layers', offdiag_source_layers, persistent=False)
+
+                decoder_rank = cfg.decoder_rank
+                # Base decoders for diagonal (l->l): [N_layers, local_d_latent, d_in]
+                self.W_dec_base = nn.Parameter(torch.empty(self.N_layers, self.local_d_latent, self.d_in, dtype=self.dtype, device=init_device))
+                self.b_dec = nn.Parameter(torch.zeros(self.N_dec, self.d_in, dtype=self.dtype, device=init_device))
+                # Low-rank updates for off-diagonal (l->k where k>l): A @ B
+                self.lora_A = nn.Parameter(torch.empty(self.N_cross, self.local_d_latent, decoder_rank, dtype=self.dtype, device=init_device))
+                self.lora_B = nn.Parameter(torch.empty(self.N_cross, decoder_rank, self.d_in, dtype=self.dtype, device=init_device))
+                self.decoder_rank = decoder_rank
+
+            else:
+                raise ValueError(f"Unknown decoder_type: {decoder_type}")
 
             layer_mask = torch.zeros(self.N_layers, self.N_dec, device=init_device, dtype=self.dtype)
             for layer in range(self.N_layers):
@@ -122,7 +151,15 @@ class CLT(nn.Module):
 
         # decoder: U(-1/(n_layers*d_model), +1/(n_layers*d_model))
         dec_lim = 1.0 / (self.N_layers * self.d_in)**0.5
-        nn.init.uniform_(self.W_dec, -dec_lim, dec_lim)
+        decoder_type = self.cfg.decoder_type
+
+        if decoder_type == "full" or not self.cfg.cross_layer_decoders:
+            nn.init.uniform_(self.W_dec, -dec_lim, dec_lim)
+        elif decoder_type == "lora":
+            nn.init.uniform_(self.W_dec_base, -dec_lim, dec_lim)
+            lora_lim = 1.0 / (self.decoder_rank ** 0.5)
+            nn.init.uniform_(self.lora_A, -lora_lim, lora_lim)
+            nn.init.zeros_(self.lora_B)  # Start with zero LoRA contribution
 
     def _initialize_b_enc(self, hidden_pre: Float[torch.Tensor, "..."]) -> None: 
         """
@@ -169,6 +206,37 @@ class CLT(nn.Module):
             # print(f"Actual average activation rate: {avg_activation_rate * self.d_latent:.0f}")
             # print(f"Expected ~{self.d_latent * target_activation_rate:.0f} ")
 
+    def _get_effective_W_dec(self) -> torch.Tensor:
+        """
+        Compute the effective decoder weight matrix from efficient parameterization.
+        Returns: [N_dec, local_d_latent, d_in] for cross-layer, [N_layers, local_d_latent, d_in] otherwise
+        """
+        if not self.cfg.cross_layer_decoders:
+            return self.W_dec
+
+        decoder_type = self.cfg.decoder_type
+
+        if decoder_type == "full":
+            return self.W_dec
+
+        elif decoder_type == "lora":
+            W_dec_full = torch.zeros(self.N_dec, self.local_d_latent, self.d_in,
+                                     dtype=self.dtype, device=self.W_dec_base.device)
+
+            # Diagonal: vectorized scatter from base
+            diag_indices = self.diag_mask.nonzero(as_tuple=True)[0]
+            W_dec_full[diag_indices] = self.W_dec_base
+
+            # Off-diagonal: batched matmul + vectorized gather
+            offdiag_indices = self.offdiag_mask.nonzero(as_tuple=True)[0]
+            lora_updates = torch.bmm(self.lora_A, self.lora_B)  # [N_cross, local_d_latent, d_in]
+            W_dec_full[offdiag_indices] = self.W_dec_base[self.offdiag_source_layers] + lora_updates
+
+            return W_dec_full
+
+        else:
+            raise ValueError(f"Unknown decoder_type: {decoder_type}")
+
     def encode(
         self,
         x: Float[torch.Tensor, "..."],
@@ -205,11 +273,13 @@ class CLT(nn.Module):
     def decode(
         self,
         z: Float[torch.Tensor, "..."],
-        layer: Optional[int] = None
+        layer: Optional[int] = None,
+        _W_dec_eff: Optional[torch.Tensor] = None,
     ) -> Float[torch.Tensor, "..."]:
         """
         z: [B, N_layers, local_d_latent] if layer is None, else [B, local_d_latent]
         output: [B, N_layers, d_in] if layer is None, else [B, N_layers_out, d_in]
+        _W_dec_eff: optional pre-computed effective decoder weights (internal caching optimization)
 
         CRITICAL: In feature sharding, after all_reduce(SUM):
         - ALL ranks have identical 'out' tensor
@@ -223,7 +293,8 @@ class CLT(nn.Module):
                 B = z.shape[0]
                 z_sel = z.index_select(1, self.l_idx)  # select source layers
 
-                contrib = torch.einsum('bkd,kdf->bkf', z_sel, self.W_dec)  # [B, N_dec, d_in]
+                W_dec_eff = _W_dec_eff if _W_dec_eff is not None else self._get_effective_W_dec()
+                contrib = torch.einsum('bkd,kdf->bkf', z_sel, W_dec_eff)  # [B, N_dec, d_in]
 
                 out = torch.zeros(B, self.N_layers, self.d_in, dtype=contrib.dtype, device=contrib.device)
                 out = out.index_add(1, self.k_idx, contrib)
@@ -251,9 +322,10 @@ class CLT(nn.Module):
             # Layer-specific decode
             assert 0 <= layer < self.N_layers, f"Layer {layer} out of range"
             if self.cfg.cross_layer_decoders:
+                W_dec_eff = _W_dec_eff if _W_dec_eff is not None else self._get_effective_W_dec()
                 indices = (self.l_idx == layer).nonzero(as_tuple=True)[0]
                 z_layer = z.unsqueeze(1).expand(-1, len(indices), -1)
-                W_dec_layer = self.W_dec[indices]
+                W_dec_layer = W_dec_eff[indices]
                 b_dec_layer = self.b_dec[indices]
                 out = torch.einsum('bkd,kdf->bkf', z_layer, W_dec_layer) + b_dec_layer
             else:
@@ -299,17 +371,20 @@ class CLT(nn.Module):
         feat_act, hidden_pre = self.encode(act_in)
         assert torch.isfinite(hidden_pre).all(), "NaN in hidden_pre"
         assert torch.isfinite(feat_act).all(), "NaN in feat_act"
-        act_pred = self.decode(feat_act.to(self.dtype))
+
+        # Pre-compute effective decoder weights once for both decode and norm computation
+        W_dec_eff = self._get_effective_W_dec() if self.cfg.cross_layer_decoders else None
+        act_pred = self.decode(feat_act.to(self.dtype), _W_dec_eff=W_dec_eff)
 
         ### MSE loss
         mse_loss_tensor = torch.nn.functional.mse_loss(act_out.float(), act_pred.float(), reduction="none")
         mse_loss_accross_layers = mse_loss_tensor.sum(dim=-1).mean(dim=0)
         mse_loss = mse_loss_accross_layers.sum()
-        
+
         if self.cfg.cross_layer_decoders:
-            squared_norms = (self.W_dec.float()**2).sum(dim=2)
-            feature_norms_local = torch.sqrt(torch.matmul(self.layer_mask.float(), squared_norms)) 
-        else: 
+            squared_norms = (W_dec_eff.float()**2).sum(dim=2)
+            feature_norms_local = torch.sqrt(torch.matmul(self.layer_mask.float(), squared_norms))
+        else:
             feature_norms_local = self.W_dec.float().norm(dim=2)
         
         # Compute L0 loss local
@@ -357,19 +432,27 @@ class CLT(nn.Module):
         )
 
     def log_loss_debug(
-        self, 
+        self,
         feat_act,
         feature_norms_local,
         l0_loss,
     ):
+        if hasattr(self, 'W_dec'):
+            dec_shape = tuple(self.W_dec.shape)
+            dec_rg = self.W_dec.requires_grad
+            dec_grad = self.W_dec.grad is not None
+        else:
+            dec_shape = tuple(self.W_dec_base.shape)
+            dec_rg = self.W_dec_base.requires_grad
+            dec_grad = self.W_dec_base.grad is not None
         logger.info(
             f"Rank {self.rank} | "
             f"feat_act shape={tuple(feat_act.shape)} | "
             f"feature_norms shape={tuple(feature_norms_local.shape)} | "
-            f"W_dec shape={tuple(self.W_dec.shape)} | "
-            f"W_dec.requires_grad={self.W_dec.requires_grad} | "
+            f"W_dec shape={dec_shape} | "
+            f"W_dec.requires_grad={dec_rg} | "
             f"feature_norms.requires_grad={feature_norms_local.requires_grad} | "
-            f"W_dec has_grad={self.W_dec.grad is not None} | "
+            f"W_dec has_grad={dec_grad} | "
             f"L0 loss={l0_loss.item():.6f}"
         )
         
@@ -401,7 +484,10 @@ class CLT(nn.Module):
 
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self):
-        self.W_dec.data /= torch.norm(self.W_dec.data, dim=2, keepdim=True)
+        if hasattr(self, 'W_dec'):
+            self.W_dec.data /= torch.norm(self.W_dec.data, dim=2, keepdim=True)
+        else:
+            self.W_dec_base.data /= torch.norm(self.W_dec_base.data, dim=2, keepdim=True)
 
     @classmethod
     def load_from_pretrained(cls, path: Union[str, Path], device: str = "cpu") -> "CLT":
@@ -492,7 +578,15 @@ def _load_full_sharded_clt(path: Union[str, Path], device: str = "cpu") -> "CLT"
     full_sd = {}
     full_sd["W_enc"] = torch.cat([s.W_enc.data for s in shards], dim=2)
     full_sd["b_enc"] = torch.cat([s.b_enc.data for s in shards], dim=1)
-    full_sd["W_dec"] = torch.cat([s.W_dec.data for s in shards], dim=1)
+
+    decoder_type = cfg_dict.get("decoder_type", "full")
+    if decoder_type == "lora":
+        full_sd["W_dec_base"] = torch.cat([s.W_dec_base.data for s in shards], dim=1)
+        full_sd["lora_A"] = torch.cat([s.lora_A.data for s in shards], dim=1)
+        full_sd["lora_B"] = torch.cat([s.lora_B.data for s in shards], dim=2)
+    else:
+        full_sd["W_dec"] = torch.cat([s.W_dec.data for s in shards], dim=1)
+
     full_sd["b_dec"] = shards[0].b_dec.data  # replicated
     full_sd["log_threshold"] = torch.cat(
         [s.log_threshold.data for s in shards], dim=1

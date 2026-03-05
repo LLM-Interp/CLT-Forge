@@ -124,6 +124,34 @@ We welcome contributions to the library. Please refer to [CONTRIBUTING.md](CONTR
 
 ------------------------------------------------------------------------
 
+## Low-Rank Decoder (LoRA)
+
+A standard CLT with cross-layer decoders has `L` encoders and `L(L+1)/2` decoders (one for each source-target layer pair where `l <= k`). For GPT-2 (L=12), that's 12 encoders and 78 decoders. Since every encoder and decoder is a `[d_latent, d_in]` matrix, the decoders dominate the parameter count.
+
+We implement a low-rank parameterization for the decoders to reduce this cost. The key observation is that off-diagonal decoders (l->k, k>l) from the same source layer `l` should be similar — they decode the same source features, just targeting different layers. So we factor them as a shared base plus a low-rank correction:
+
+- **Encoders** (L): unchanged, full-rank. Only 12 matrices, and each layer's input distribution is different enough that sharing would hurt quality.
+- **Diagonal decoders** (L): full-rank base matrices `W_dec_base[l]`, one per source layer. These handle same-layer reconstruction (the strongest signal) and also serve as the shared base for off-diagonal decoders.
+- **Off-diagonal decoders** (L(L-1)/2): parameterized as `W_dec_base[l] + lora_A[i] @ lora_B[i]`, where `lora_A` is `[d_latent, r]` and `lora_B` is `[r, d_in]`. The low-rank term captures how decoding to layer `k` differs from decoding to layer `l`.
+
+The effective decoder weights are reconstructed via a single batched matmul (`torch.bmm`) and cached within each training step, so the overhead is minimal.
+
+To train with LoRA decoders, set `decoder_type="lora"` and `decoder_rank=r` in the config:
+
+```python
+cfg = CLTTrainingRunnerConfig(
+    ...,
+    decoder_type="lora",   # "full" (default) or "lora"
+    decoder_rank=64,       # rank of the low-rank correction
+)
+```
+
+For GPT-2 with `d_latent=12288, d_in=768, r=64`, LoRA reduces decoder parameters from ~736M to ~168M (~77% reduction).
+
+See `examples/lora` for an example script to run LoRA.
+
+------------------------------------------------------------------------
+
 ## ⚙️ Notes
 - Training happens in **multiple steps**:
   1.  **Precompute activations** (should be parallelized across indepedent jobs)
