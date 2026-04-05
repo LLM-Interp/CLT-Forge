@@ -17,7 +17,7 @@
   </a>
 </p>
 
-**CLT-Forge** is a Mechanistic Interpretability Toolkit for jointly training [Cross-Layer Transcoders](https://transformer-circuits.pub/2025/attribution-graphs/methods.html) (CLTs), running the auto-interp, computing the attribution-graph, and interact with a visual interface. We will soon release open-source CLTs with the library (up to 8B parameters), along with automated interpretation and code for interacting with existing open-source CLTs (e.g., Gemma 2B), enabling direct comparisons within a unified framework. We are currently adding extensions for lower-compute academic budget (e.g. low-rank finetuning of CLTs, ...). 
+**CLT-Forge** is a Mechanistic Interpretability Toolkit for jointly training [Cross-Layer Transcoders](https://transformer-circuits.pub/2025/attribution-graphs/methods.html) (CLTs), running the auto-interp, computing the attribution-graph, and interact with a visual interface. We will soon release open-source CLTs with the library (up to 8B parameters), along with automated interpretation and code for interacting with existing open-source CLTs (e.g., Gemma 2B), enabling direct comparisons within a unified framework. We are currently adding extensions for lower-compute academic budget (e.g. low-rank finetuning of CLTs, ...). This is the official repository for our paper "**CLT-Forge: A Scalable Library for Cross-Layer Transcoders and Attribution Graphs**`` ([arXiv](https://arxiv.org/abs/2603.21014)).
 
 We believe that a major limitation in the development of CLTs, and more broadly attribution graph methods, is the significant engineering effort required to train, analyze, and iterate on them. This library aims to reduce that overhead by providing a clean, scalable, and extensible framework for academia. 
 
@@ -140,17 +140,15 @@ We welcome contributions to the library. Please refer to [CONTRIBUTING.md](CONTR
 
 ## Citation
 
-<!-- ```bibtex
-@misc{CircuitLab,
-  title   = {CircuitLab: A Scalable Framework for Cross-Layer Transcoders Training and Attribution-Graph Visualization},
-  author  = {Draye, Florent and Harasse, Abir and },
-  year    = {2026},
-  url     = {https://github.com/CLT-Training/CLT/}
-} -->
-
-<!-- @misc{CircuitLab2026,
-  title   = {CircuitLab: A Scalable Framework for Cross-Layer Transcoders Training and Attribution-Graph Visualization},
-  author  = {Florent Draye and Abir Harrasse and Vedant Palit and TY Wu and Jiarui Liu and PS Pandey and Roderick Wu and Zhijing Jin and Bernhard Sch{\"o}lkopf},
-  year    = {2026},
-  url     = {https://github.com/CLT-Training/CLT/}
-} -->
+If you found CLT-Forge useful for your research, please cite our paper:
+```bibtex
+@misc{draye2026cltforgescalablelibrarycrosslayer,
+      title={CLT-Forge: A Scalable Library for Cross-Layer Transcoders and Attribution Graphs}, 
+      author={Florent Draye and Abir Harrasse and Vedant Palit and Tung-Yu Wu and Jiarui Liu and Punya Syon Pandey and Roderick Wu and Terry Jingchen Zhang and Zhijing Jin and Bernhard Schölkopf},
+      year={2026},
+      eprint={2603.21014},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2603.21014}, 
+}
+```
