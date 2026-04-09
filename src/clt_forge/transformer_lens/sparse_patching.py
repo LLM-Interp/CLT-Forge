@@ -7,6 +7,7 @@ def patch_sparse_attention_models():
         
         # Add sparse models from files_to_patch
         sparse_models = [
+            "ansonisl/ShortSparseLlama1B",
             "ansonisl/SparseGPT2",
             "ansonisl/SparseTinystories", 
             "ansonisl/DenseTinystories",
@@ -19,6 +20,7 @@ def patch_sparse_attention_models():
         
         # Add aliases for sparse models
         sparse_aliases = {
+            "ansonisl/ShortSparseLlama1B": ["sparse-llama"],
             "ansonisl/SparseGPT2": ["sparse-gpt2"],
             "ansonisl/SparseTinystories": ["sparse-tinystories"],
             "ansonisl/DenseTinystories": ["dense-tinystories"],
@@ -243,7 +245,7 @@ def patch_sparse_attention_components():
 
 def patch_sparse_attention():
     """Patch TransformerLens with sparse attention support using runtime patching."""
-    # patch_sparse_attention_models()
-    # patch_sparse_attention_config()
-    # patch_sparse_attention_components()
+    patch_sparse_attention_models()
+    patch_sparse_attention_config()
+    patch_sparse_attention_components()
     print("Successfully patched TransformerLens for sparse attention support")

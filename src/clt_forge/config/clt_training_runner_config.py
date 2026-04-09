@@ -28,6 +28,7 @@ class CLTTrainingRunnerConfig(BaseModel):
     split: str = "train"
     disk: bool = False # use load_from_disk instead and local dataset
     streaming: bool = False
+    sparse_attention: bool = False # for using sparse attention models 
 
     # -----CLT parameters---------------------
     from_pretrained_path: str | None = None
@@ -261,7 +262,8 @@ class CLTTrainingRunnerConfig(BaseModel):
     
     @property
     def total_training_steps(self) -> int:
-        n_training_steps = int(self.total_training_tokens // self.train_batch_size_tokens)
+        print(self.total_training_tokens, self.train_batch_size_tokens, self.gradient_accumulation_steps)
+        n_training_steps = int(self.total_training_tokens // (self.train_batch_size_tokens * self.gradient_accumulation_steps))
         return n_training_steps
 
     @property

@@ -10,7 +10,7 @@ from clt_forge.transformer_lens.multilingual_patching import patch_official_mode
 from clt_forge.training.activations_store import ActivationsStore
 from clt_forge.training.compressed_activations_store import CompressionConfig
 from clt_forge.infra.jobs_id import compute_job_split_range
-from runners.training.llama1b.config import clt_training_runner_config
+from runners.training.llama1b_multilingual.config import clt_training_runner_config
 
 from sae_lens.load_model import load_model
 
@@ -22,15 +22,15 @@ def main(job_id: int, total_jobs: int):
     cached_activations_path = cfg.cached_activations_path
     cfg.cached_activations_path = None
 
-    # number of token activations to save, could more than total_training_tokens 
-    number_of_tokens = 300_000_000
-    buffer_size = cfg.store_batch_size_prompts * cfg.context_size * cfg.n_batches_in_buffer
-    total_splits = int(number_of_tokens / buffer_size)
+    total_splits = 128 * 30
     split_begin_idx, split_end_idx = compute_job_split_range(
         job_id=job_id,
         total_jobs=total_jobs,
         total_splits=total_splits,
     )
+
+    # number of token activations to save, could more than total_training_tokens 
+    number_of_tokens = 300_000_000
 
     print(f"Job {job_id}: Processing splits {split_begin_idx} to {split_end_idx-1}")
 

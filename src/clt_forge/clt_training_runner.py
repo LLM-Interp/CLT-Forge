@@ -11,6 +11,7 @@ from torch.distributed.fsdp import StateDictType, FullStateDictConfig
 from transformers import AutoConfig
 from sae_lens.load_model import load_model
 
+from clt_forge.transformer_lens.sparse_patching import patch_sparse_attention
 from clt_forge.transformer_lens.multilingual_patching import patch_official_model_names, patch_convert_hf_model_config
 from clt_forge.config import CLTTrainingRunnerConfig, CLTConfig
 from clt_forge.utils import DTYPE_MAP, DummyModel
@@ -53,7 +54,9 @@ class CLTTrainingRunner:
 
         self.is_main_process = True if self.rank == 0 else False
         self.device = torch.device(self.cfg.device)
-        
+
+        if self.cfg.sparse_attention: 
+            patch_sparse_attention()      
         # For multlingual models added to transformer-lens
         if self.cfg.is_multilingual_split_dataset: 
             logger.info("Adding names to Transformer Lens")

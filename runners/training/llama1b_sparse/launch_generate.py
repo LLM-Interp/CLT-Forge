@@ -6,11 +6,12 @@ import sys
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from clt_forge.transformer_lens.sparse_patching import patch_sparse_attention
 from clt_forge.transformer_lens.multilingual_patching import patch_official_model_names, patch_convert_hf_model_config
 from clt_forge.training.activations_store import ActivationsStore
 from clt_forge.training.compressed_activations_store import CompressionConfig
 from clt_forge.infra.jobs_id import compute_job_split_range
-from runners.training.llama1b.config import clt_training_runner_config
+from runners.training.llama1b_sparse.config import clt_training_runner_config
 
 from sae_lens.load_model import load_model
 
@@ -23,7 +24,7 @@ def main(job_id: int, total_jobs: int):
     cfg.cached_activations_path = None
 
     # number of token activations to save, could more than total_training_tokens 
-    number_of_tokens = 300_000_000
+    number_of_tokens = 150_000_000
     buffer_size = cfg.store_batch_size_prompts * cfg.context_size * cfg.n_batches_in_buffer
     total_splits = int(number_of_tokens / buffer_size)
     split_begin_idx, split_end_idx = compute_job_split_range(
@@ -33,6 +34,8 @@ def main(job_id: int, total_jobs: int):
     )
 
     print(f"Job {job_id}: Processing splits {split_begin_idx} to {split_end_idx-1}")
+
+    patch_sparse_attention()
 
     if cfg.is_multilingual_split_dataset:
         patch_official_model_names()

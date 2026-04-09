@@ -595,7 +595,7 @@ class ActivationsStore:
 
     def _load_cached_activations(self) -> None:
         if not hasattr(self, "split"):
-            self.split = self.rank + 1201
+            self.split = self.rank
             
         if self.cfg.cached_activations_path is None:
             raise ValueError("cached_activations_path must not be None here")

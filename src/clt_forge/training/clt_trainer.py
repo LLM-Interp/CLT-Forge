@@ -70,6 +70,9 @@ class CLTTrainer():
             lr_waiting_steps = cfg.l0_waiting_steps
         )
 
+        print(f"total {cfg.total_training_steps}")
+        print(f"warm up {cfg.l0_warm_up_steps}")
+
         self.optimizer = Adam(
             self.clt.parameters(),
             lr=cfg.lr,

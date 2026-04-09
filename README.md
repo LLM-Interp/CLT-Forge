@@ -114,7 +114,8 @@ This library currently implements L1-regularized [JumpReLU](https://arxiv.org/pd
 
 - Follows Anthropic's [training guidelines]((https://transformer-circuits.pub/2025/january-update/index.html))
 - Supports feature sharding across GPUs (as well as DDP and FSDP)  
-- Includes activation caching and compression/quantization of the activations  
+- Includes activation caching and compression/quantization of the activations
+- Optimized accelerator/disk communication for activation loading
 - Adopts a structure similar to [SAE Lens](https://github.com/jbloomAus/SAELens) (code design, activation-store, etc.) and uses [Transformer Lens](https://github.com/TransformerLensOrg/TransformerLens)
 - Includes a visual interface for exploring features and attribution graphs:
   - Similar in spirit (but simpler) to [Neuronpedia](https://github.com/hijohnnylin/neuronpedia)

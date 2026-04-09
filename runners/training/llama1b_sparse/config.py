@@ -6,14 +6,14 @@ import clt_forge
 STORAGE_ROOT = Path(clt_forge.__file__).resolve().parents[2] / "storage" # symlink to scratch
 
 def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: bool = False):
-    MODEL = "meta-llama/Llama-3.2-1B"
+    MODEL = "ansonisl/ShortSparseLlama1B"
 
     # Training type in ["None", "ddp", "sfdp", "feature_sharding"]
     distributed_setup = "feature_sharding" if not generation else "None"
     
     ### IMPORTANT, where activations will be stored (around 1-2TB)
-    activations_root = STORAGE_ROOT / Path("activations") / f"{MODEL.replace('/', '_')}_BF16"
-    checkpoints_root = STORAGE_ROOT / Path("checkpoints") / f"{MODEL.replace('/', '_')}_BF16"
+    activations_root = STORAGE_ROOT / Path("activations") / f"{MODEL.replace('/', '_')}_BF16_sparse"
+    checkpoints_root = STORAGE_ROOT / Path("checkpoints") / f"{MODEL.replace('/', '_')}_BF16_sparse"
 
     gradient_accumulation_steps = 4
     total_training_steps = 75_000
@@ -24,8 +24,8 @@ def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: b
     final_lr_scale = 0.0
     lr_warm_up_steps = 1000
 
-    l0_waiting_steps = int(0.5 * total_training_steps)
-    l0_warm_up_steps = int(0.95 * total_training_steps) - l0_waiting_steps - 1
+    l0_waiting_steps = 0
+    l0_warm_up_steps = int(0.7 * total_training_steps) - l0_waiting_steps - 1
     decay_stable_steps = total_training_steps - l0_warm_up_steps - lr_decay_steps
 
     cfg = CLTTrainingRunnerConfig(
@@ -39,6 +39,7 @@ def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: b
         model_name=MODEL,
         dataset_path="chanind/openwebtext-llama3",
         streaming=True,
+        sparse_attention=True,
         context_size=64,
         from_pretrained_path=None,
         d_in=2048,
@@ -57,8 +58,8 @@ def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: b
         lr_decay_steps=lr_decay_steps,
         final_lr_scale=final_lr_scale,
         l0_warm_up_type="cosine",
-        l0_coefficient=12.,
-        dead_penalty_coef=1e-5,
+        l0_coefficient=10.,
+        dead_penalty_coef=1e-4,
         dead_feature_window=250,
         l0_warm_up_steps=l0_warm_up_steps,
         l0_waiting_steps=l0_waiting_steps,
