@@ -24,8 +24,8 @@ def clt_training_runner_config(rank: int = 0, world_size: int = 1, generation: b
     final_lr_scale = 0.0
     lr_warm_up_steps = 1000
 
-    l0_waiting_steps = int(0.5 * total_training_steps)
-    l0_warm_up_steps = int(0.95 * total_training_steps) - l0_waiting_steps - 1
+    l0_waiting_steps = 1_000
+    l0_warm_up_steps = int(0.9 * total_training_steps) - l0_waiting_steps - 1
     decay_stable_steps = total_training_steps - l0_warm_up_steps - lr_decay_steps
 
     cfg = CLTTrainingRunnerConfig(

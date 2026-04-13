@@ -38,7 +38,7 @@ save/
 CLAUDE.md
 
 # data
-data/
+/data/
 
 # Byte-compiled 
 __pycache__/

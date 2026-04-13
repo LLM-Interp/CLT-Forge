@@ -4,7 +4,7 @@ import torch
 import os
 
 from clt_forge.config.autointerp_config import AutoInterpConfig
-from clt_forge.autointerp.pipeline_new import AutoInterp
+from clt_forge.autointerp.pipeline import AutoInterp
 
 import clt_forge
 STORAGE_ROOT = Path(clt_forge.__file__).resolve().parents[2] / "storage"
