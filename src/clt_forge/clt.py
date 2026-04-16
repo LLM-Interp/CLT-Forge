@@ -410,7 +410,9 @@ class CLT(nn.Module):
         with cfg_path.open("r") as f:
             cfg_dict = json.load(f)
 
-        if cfg_dict.get("is_sharded", False):
+        cfg = CLTConfig.from_dict(cfg_dict)
+
+        if cfg.is_sharded:
             return _load_full_sharded_clt(path, device=device)
         else:
             return CLT._load_from_pretrained(
@@ -468,7 +470,9 @@ def _load_full_sharded_clt(path: Union[str, Path], device: str = "cpu") -> "CLT"
     with cfg_path.open("r") as f:
         cfg_dict = json.load(f)
 
-    if not cfg_dict.get("is_sharded", False):
+    cfg = CLTConfig.from_dict(cfg_dict)
+
+    if not cfg.is_sharded:
         raise ValueError("This function should be called for feature sharded CLTs")
 
     world_size = cfg_dict.get(
