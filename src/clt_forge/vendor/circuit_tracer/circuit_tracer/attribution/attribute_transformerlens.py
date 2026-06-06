@@ -130,31 +130,43 @@ def _run_attribution(
     logger,
     update_interval=4,
 ):
+    import math
+    import torch.distributed as dist
+    is_dist = dist.is_available() and dist.is_initialized()
+    if is_dist:
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        rank = 0
+        world_size = 1
+
+    unwrapped_model = model.module if hasattr(model, "module") else model
+
     start_time = time.time()
     # Phase 0: precompute
     logger.info("Phase 0: Precomputing activations and vectors")
     phase_start = time.time()
-    input_ids = model.ensure_tokenized(prompt)
+    input_ids = unwrapped_model.ensure_tokenized(prompt)
 
-    ctx = model.setup_attribution(input_ids)
+    ctx = unwrapped_model.setup_attribution(input_ids, model_wrapper=model)
     activation_matrix = ctx.activation_matrix
 
     logger.info(f"Precomputation completed in {time.time() - phase_start:.2f}s")
     logger.info(f"Found {ctx.activation_matrix._nnz()} active features")
 
     if offload:
-        offload_handles += offload_modules(model.transcoders, offload)
+        offload_handles += offload_modules(unwrapped_model.transcoders, offload)
 
     # Phase 1: forward pass
     logger.info("Phase 1: Running forward pass")
     phase_start = time.time()
-    with ctx.install_hooks(model):
-        residual = model.forward(input_ids.expand(batch_size, -1), stop_at_layer=model.cfg.n_layers)
-        ctx._resid_activations[-1] = model.ln_final(residual)
+    with ctx.install_hooks(unwrapped_model):
+        residual = model(input_ids.expand(batch_size, -1), stop_at_layer=unwrapped_model.cfg.n_layers)
+        ctx._resid_activations[-1] = unwrapped_model.ln_final(residual)
     logger.info(f"Forward pass completed in {time.time() - phase_start:.2f}s")
 
     if offload:
-        offload_handles += offload_modules([block.mlp for block in model.blocks], offload)
+        offload_handles += offload_modules([block.mlp for block in unwrapped_model.blocks], offload)
 
     # Phase 2: build input vector list
     logger.info("Phase 2: Building input vectors")
@@ -166,8 +178,8 @@ def _run_attribution(
     targets = AttributionTargets(
         attribution_targets=attribution_targets,
         logits=ctx.logits[0, -1],
-        unembed_proj=model.unembed.W_U,
-        tokenizer=model.tokenizer,
+        unembed_proj=unwrapped_model.unembed.W_U,
+        tokenizer=unwrapped_model.tokenizer,
         max_n_logits=max_n_logits,
         desired_logit_prob=desired_logit_prob,
     )
@@ -175,7 +187,7 @@ def _run_attribution(
     log_attribution_target_info(targets, attribution_targets, logger)
 
     if offload:
-        offload_handles += offload_modules([model.unembed, model.embed], offload)
+        offload_handles += offload_modules([unwrapped_model.unembed, unwrapped_model.embed], offload)
 
     logit_offset = len(feat_layers) + (n_layers + 1) * n_pos
     n_logits = len(targets)
@@ -193,17 +205,40 @@ def _run_attribution(
     # Phase 3: logit attribution
     logger.info("Phase 3: Computing logit attributions")
     phase_start = time.time()
-    for i in range(0, len(targets), batch_size):
-        batch = targets.logit_vectors[i : i + batch_size]
-        rows = ctx.compute_batch(
-            layers=torch.full((batch.shape[0],), n_layers),
-            positions=torch.full((batch.shape[0],), n_pos - 1),
-            inject_values=batch,
-        )
-        edge_matrix[i : i + batch.shape[0], :logit_offset] = rows.cpu()
-        row_to_node_index[i : i + batch.shape[0]] = (
-            torch.arange(i, i + batch.shape[0]) + logit_offset
-        )
+    if is_dist:
+        n_targets = len(targets)
+        local_target_indices = list(range(rank, n_targets, world_size))
+        local_rows_list = []
+        for chunk_start in range(0, len(local_target_indices), batch_size):
+            chunk_indices = local_target_indices[chunk_start : chunk_start + batch_size]
+            batch = targets.logit_vectors[chunk_indices]
+            rows = ctx.compute_batch(
+                layers=torch.full((batch.shape[0],), n_layers, device=unwrapped_model.cfg.device),
+                positions=torch.full((batch.shape[0],), n_pos - 1, device=unwrapped_model.cfg.device),
+                inject_values=batch,
+                retain_graph=True,
+            )
+            local_rows_list.append((chunk_indices, rows))
+        
+        edge_matrix_logits = torch.zeros(n_logits, logit_offset, device=unwrapped_model.cfg.device)
+        for idxs, rows in local_rows_list:
+            edge_matrix_logits[idxs] = rows.to(device=edge_matrix_logits.device)
+            
+        dist.all_reduce(edge_matrix_logits, op=dist.ReduceOp.SUM)
+        edge_matrix[:n_logits, :logit_offset] = edge_matrix_logits.cpu()
+        row_to_node_index[:n_logits] = torch.arange(n_logits) + logit_offset
+    else:
+        for i in range(0, len(targets), batch_size):
+            batch = targets.logit_vectors[i : i + batch_size]
+            rows = ctx.compute_batch(
+                layers=torch.full((batch.shape[0],), n_layers),
+                positions=torch.full((batch.shape[0],), n_pos - 1),
+                inject_values=batch,
+            )
+            edge_matrix[i : i + batch.shape[0], :logit_offset] = rows.cpu()
+            row_to_node_index[i : i + batch.shape[0]] = (
+                torch.arange(i, i + batch.shape[0]) + logit_offset
+            )
     logger.info(f"Logit attributions completed in {time.time() - phase_start:.2f}s")
 
     # Phase 4: feature attribution
@@ -213,7 +248,7 @@ def _run_attribution(
     visited = torch.zeros(total_active_feats, dtype=torch.bool)
     n_visited = 0
 
-    pbar = tqdm(total=max_feature_nodes, desc="Feature influence computation", disable=not verbose)
+    pbar = tqdm(total=max_feature_nodes, desc="Feature influence computation", disable=not verbose or rank != 0)
 
     while n_visited < max_feature_nodes:
         if max_feature_nodes == total_active_feats:
@@ -226,24 +261,64 @@ def _run_attribution(
             queue_size = min(update_interval * batch_size, max_feature_nodes - n_visited)
             pending = feature_rank[~visited[feature_rank]][:queue_size]
 
-        queue = [pending[i : i + batch_size] for i in range(0, len(pending), batch_size)]
+        if is_dist:
+            local_size = (len(pending) + world_size - 1) // world_size
+            local_pending = torch.zeros(local_size, dtype=torch.long, device=feat_layers.device)
+            for r in range(world_size):
+                r_indices = pending[r::world_size]
+                if rank == r:
+                    local_pending[:len(r_indices)] = r_indices
+            
+            for i in range(0, local_size, batch_size):
+                local_batch = local_pending[i : i + batch_size]
+                local_len = len(local_batch)
+                
+                rows = ctx.compute_batch(
+                    layers=feat_layers[local_batch],
+                    positions=feat_pos[local_batch],
+                    inject_values=ctx.encoder_vecs[local_batch],
+                    retain_graph=n_visited < max_feature_nodes,
+                )
+                
+                gathered_rows = [torch.zeros_like(rows) for _ in range(world_size)]
+                gathered_indices = [torch.zeros(local_len, dtype=torch.long, device=feat_layers.device) for _ in range(world_size)]
+                
+                dist.all_gather(gathered_rows, rows)
+                dist.all_gather(gathered_indices, local_batch)
+                
+                for j in range(local_len):
+                    for r in range(world_size):
+                        total_idx = (i + j) * world_size + r
+                        if total_idx < len(pending):
+                            orig_idx = pending[total_idx].item()
+                            row_val = gathered_rows[r][j]
+                            
+                            edge_matrix[st, :logit_offset] = row_val.cpu()
+                            row_to_node_index[st] = orig_idx
+                            visited[orig_idx] = True
+                            st += 1
+                            n_visited += 1
+                            if rank == 0:
+                                pbar.update(1)
+        else:
+            queue = [pending[i : i + batch_size] for i in range(0, len(pending), batch_size)]
 
-        for idx_batch in queue:
-            n_visited += len(idx_batch)
+            for idx_batch in queue:
+                n_visited += len(idx_batch)
 
-            rows = ctx.compute_batch(
-                layers=feat_layers[idx_batch],
-                positions=feat_pos[idx_batch],
-                inject_values=ctx.encoder_vecs[idx_batch],
-                retain_graph=n_visited < max_feature_nodes,
-            )
+                rows = ctx.compute_batch(
+                    layers=feat_layers[idx_batch],
+                    positions=feat_pos[idx_batch],
+                    inject_values=ctx.encoder_vecs[idx_batch],
+                    retain_graph=n_visited < max_feature_nodes,
+                )
 
-            end = min(st + batch_size, st + rows.shape[0])
-            edge_matrix[st:end, :logit_offset] = rows.cpu()
-            row_to_node_index[st:end] = idx_batch
-            visited[idx_batch] = True
-            st = end
-            pbar.update(len(idx_batch))
+                end = min(st + batch_size, st + rows.shape[0])
+                edge_matrix[st:end, :logit_offset] = rows.cpu()
+                row_to_node_index[st:end] = idx_batch
+                visited[idx_batch] = True
+                st = end
+                pbar.update(len(idx_batch))
 
     pbar.close()
     logger.info(f"Feature attributions completed in {time.time() - phase_start:.2f}s")
@@ -263,7 +338,7 @@ def _run_attribution(
     full_edge_matrix[-n_logits:] = edge_matrix[max_feature_nodes:]
 
     graph = Graph(
-        input_string=model.tokenizer.decode(input_ids),
+        input_string=unwrapped_model.tokenizer.decode(input_ids),
         input_tokens=input_ids,
         logit_targets=targets.logit_targets,
         logit_probabilities=targets.logit_probabilities,
@@ -272,8 +347,8 @@ def _run_attribution(
         activation_values=activation_matrix.values(),
         selected_features=selected_features,
         adjacency_matrix=full_edge_matrix,
-        cfg=model.cfg,
-        scan=model.scan,
+        cfg=unwrapped_model.cfg,
+        scan=unwrapped_model.scan,
     )
 
     total_time = time.time() - start_time

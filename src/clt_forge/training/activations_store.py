@@ -376,64 +376,81 @@ class ActivationsStore:
         norms_per_layer_in = []
         norms_per_layer_out = []
 
-        self.estimated_norm_scaling_factor_in = torch.ones(self.N_layers, device=self.device).float()
-        self.estimated_norm_scaling_factor_out = torch.ones(self.N_layers, device=self.device).float()
+        # Allocate directly on GPU as float32 so all arithmetic stays on-device
+        self.estimated_norm_scaling_factor_in = torch.ones(
+            self.N_layers, device=self.device, dtype=torch.float32
+        )
+        self.estimated_norm_scaling_factor_out = torch.ones(
+            self.N_layers, device=self.device, dtype=torch.float32
+        )
 
         for _ in tqdm(range(n_batches_for_norm_estimate), 
                       desc="Estimating norm scaling factor", 
                       disable=(self.rank != 0)): 
             
-            # cache_ptr is aligned across all nodes.
+            # All ranks consume a batch to keep cache pointers in sync.
             acts_in, acts_out = next(iter(self))
 
             if self.rank == 0:
-                norms_per_layer_in.append(acts_in.norm(dim=-1).mean(dim=0).float())
-                norms_per_layer_out.append(acts_out.norm(dim=-1).mean(dim=0).float())
+                # Cast to float32 before norm so we don't lose precision with bf16/fp16;
+                # .norm() and .mean() both stay on GPU.
+                norms_per_layer_in.append(
+                    acts_in.float().norm(dim=-1).mean(dim=0)   # [N_layers] on GPU
+                )
+                norms_per_layer_out.append(
+                    acts_out.float().norm(dim=-1).mean(dim=0)  # [N_layers] on GPU
+                )
 
         del acts_in, acts_out
             
         if self.rank == 0:
 
-            mean_norm_per_layer_in = torch.stack(norms_per_layer_in, dim=0).mean(dim=0)
+            # torch.stack keeps tensors on their original device (GPU)
+            mean_norm_per_layer_in  = torch.stack(norms_per_layer_in,  dim=0).mean(dim=0)
             mean_norm_per_layer_out = torch.stack(norms_per_layer_out, dim=0).mean(dim=0)
             
-            # The scaling factor is calculated to normalize the norm of the activations 
-            # to the square root of the input dimension (d_in ** 0.5)
-            self.estimated_norm_scaling_factor_in = (self.cfg.d_in ** 0.5) / mean_norm_per_layer_in
+            # The scaling factor normalises activation norms to sqrt(d_in)
+            self.estimated_norm_scaling_factor_in  = (self.cfg.d_in ** 0.5) / mean_norm_per_layer_in
             self.estimated_norm_scaling_factor_out = (self.cfg.d_in ** 0.5) / mean_norm_per_layer_out
 
-            logger.info(f"Estimated norm scaling factor in: {self.estimated_norm_scaling_factor_in}")
+            logger.info(f"Estimated norm scaling factor in:  {self.estimated_norm_scaling_factor_in}")
             logger.info(f"Estimated norm scaling factor out: {self.estimated_norm_scaling_factor_out}")
 
-        return self.estimated_norm_scaling_factor_in.to(self.dtype), self.estimated_norm_scaling_factor_out.to(self.dtype)  
+        # Guarantee the returned tensors are on self.device with the correct training dtype.
+        # Using both device= and dtype= avoids the silent CPU placement that
+        # `.to(self.dtype)` alone could cause when dtype is unchanged.
+        return (
+            self.estimated_norm_scaling_factor_in.to(device=self.device, dtype=self.dtype),
+            self.estimated_norm_scaling_factor_out.to(device=self.device, dtype=self.dtype),
+        )
 
     @torch.no_grad()
     def set_norm_scaling_factor_if_needed(self):
 
         if self.estimated_norm_scaling_factor_in is None or self.estimated_norm_scaling_factor_out is None:
             
-            # ensures all ranks consume batches (important for feature_sharding to keep same pointer)
-            self.estimated_norm_scaling_factor_in, self.estimated_norm_scaling_factor_out = self.estimate_norm_scaling_factor(self.cfg.n_batches_for_norm_estimate)
+            # All ranks consume batches to keep cache pointers aligned.
+            # `estimate_norm_scaling_factor` now guarantees the returned tensors
+            # are on self.device with the correct dtype — no extra .to() needed.
+            self.estimated_norm_scaling_factor_in, self.estimated_norm_scaling_factor_out = \
+                self.estimate_norm_scaling_factor(self.cfg.n_batches_for_norm_estimate)
             
             if self.cfg.uses_process_group:
-                dist.barrier() 
-
-                tensor_in = self.estimated_norm_scaling_factor_in.to(self.device)
-                tensor_out = self.estimated_norm_scaling_factor_out.to(self.device)
-
-                dist.broadcast(tensor_in, src=0)
-                dist.broadcast(tensor_out, src=0)
-
-                self.estimated_norm_scaling_factor_in = tensor_in
-                self.estimated_norm_scaling_factor_out = tensor_out
+                dist.barrier()
+                # Tensors are already on self.device; broadcast rank-0's values to all ranks.
+                dist.broadcast(self.estimated_norm_scaling_factor_in,  src=0)
+                dist.broadcast(self.estimated_norm_scaling_factor_out, src=0)
 
     def apply_norm_scaling_factor_in(self, activations: torch.Tensor) -> torch.Tensor:
         if self.estimated_norm_scaling_factor_in is None:
             raise ValueError(
                 "estimated_norm_scaling_factor_in is not set, call set_norm_scaling_factor_if_needed() first"
             )
-        scaling = self.estimated_norm_scaling_factor_in.view(1, -1, 1)
-        activations *= scaling # in-place operation not copying tensor
+        # Move scaling to the same device/dtype as the activations (defensive; normally a no-op)
+        scaling = self.estimated_norm_scaling_factor_in.to(
+            device=activations.device, dtype=activations.dtype
+        ).view(1, -1, 1)
+        activations *= scaling  # in-place — no extra allocation
         return activations
 
     def apply_norm_scaling_factor_out(self, activations: torch.Tensor) -> torch.Tensor:
@@ -441,8 +458,11 @@ class ActivationsStore:
             raise ValueError(
                 "estimated_norm_scaling_factor_out is not set, call set_norm_scaling_factor_if_needed() first"
             )
-        scaling = self.estimated_norm_scaling_factor_out.view(1, -1, 1)
-        activations *= scaling # in-place operation not copying tensor
+        # Move scaling to the same device/dtype as the activations (defensive; normally a no-op)
+        scaling = self.estimated_norm_scaling_factor_out.to(
+            device=activations.device, dtype=activations.dtype
+        ).view(1, -1, 1)
+        activations *= scaling  # in-place — no extra allocation
         return activations
 
     def remove_norm_scaling_factor_in(self, activations: torch.Tensor) -> torch.Tensor:
@@ -450,8 +470,11 @@ class ActivationsStore:
             raise ValueError(
                 "estimated_norm_scaling_factor_in is not set, call set_norm_scaling_factor_if_needed() first"
             )
-        scaling = self.estimated_norm_scaling_factor_in.view(1, -1, 1)
-        activations /= scaling # in-place operation not copying tensor
+        # Move scaling to the same device/dtype as the activations (defensive; normally a no-op)
+        scaling = self.estimated_norm_scaling_factor_in.to(
+            device=activations.device, dtype=activations.dtype
+        ).view(1, -1, 1)
+        activations /= scaling  # in-place — no extra allocation
         return activations
 
     def remove_norm_scaling_factor_out(self, activations: torch.Tensor) -> torch.Tensor:
@@ -459,8 +482,11 @@ class ActivationsStore:
             raise ValueError(
                 "estimated_norm_scaling_factor_out is not set, call set_norm_scaling_factor_if_needed() first"
             )
-        scaling = self.estimated_norm_scaling_factor_out.view(1, -1, 1)
-        activations /=  scaling
+        # Move scaling to the same device/dtype as the activations (defensive; normally a no-op)
+        scaling = self.estimated_norm_scaling_factor_out.to(
+            device=activations.device, dtype=activations.dtype
+        ).view(1, -1, 1)
+        activations /= scaling  # in-place — no extra allocation
         return activations
 
     # ------------------ Generate activations, save to and load from disk ------------------

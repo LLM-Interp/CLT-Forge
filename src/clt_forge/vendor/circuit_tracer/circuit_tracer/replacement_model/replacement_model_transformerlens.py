@@ -422,13 +422,14 @@ class TransformerLensReplacementModel(HookedTransformer):
         return tokens.to(self.cfg.device)
 
     @torch.no_grad()
-    def setup_attribution(self, inputs: str | torch.Tensor):
+    def setup_attribution(self, inputs: str | torch.Tensor, model_wrapper=None):
         """Precomputes the transcoder activations and error vectors, saving them and the
         token embeddings.
 
         Args:
             inputs (str): the inputs to attribute - hard coded to be a single string (no
                 batching) for now
+            model_wrapper: DDP/FSDP wrapper if model is wrapped.
         """
 
         if isinstance(inputs, str):
@@ -446,7 +447,11 @@ class TransformerLensReplacementModel(HookedTransformer):
         mlp_out_cache, mlp_out_caching_hooks, _ = self.get_caching_hooks(
             lambda name: self.feature_output_hook in name
         )
-        logits = self.run_with_hooks(tokens, fwd_hooks=mlp_in_caching_hooks + mlp_out_caching_hooks)
+        if model_wrapper is not None:
+            with self.hooks(fwd_hooks=mlp_in_caching_hooks + mlp_out_caching_hooks):
+                logits = model_wrapper(tokens)
+        else:
+            logits = self.run_with_hooks(tokens, fwd_hooks=mlp_in_caching_hooks + mlp_out_caching_hooks)
 
         mlp_in_cache = torch.cat(list(mlp_in_cache.values()), dim=0)
         mlp_out_cache = torch.cat(list(mlp_out_cache.values()), dim=0)
