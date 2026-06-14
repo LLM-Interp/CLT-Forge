@@ -29,8 +29,13 @@ class CLTConfig(BaseModel):
     l0_coefficient: float
 
     # -----Sparse decode----------------------
+    # auto mode switches dense->gather once sparsity >= sparse_threshold. The
+    # default is the empirically measured crossover: on a 3090 (bf16, B=1024,
+    # d_latent=24576, fwd+bwd) gather only beats dense above ~99.95% sparsity
+    # (see scripts/benchmark_sparse_decode.py). Below that, gather is slower and
+    # can OOM (it materializes an [nnz, d_in] intermediate), so switch late.
     sparse_decode: Literal["dense", "gather", "csr", "auto"] = "dense"
-    sparse_threshold: float = 0.90
+    sparse_threshold: float = 0.9995
 
     # -----DDP--------------------------------
     ddp: bool = False

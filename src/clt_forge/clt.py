@@ -350,7 +350,18 @@ class CLT(nn.Module):
         return out
 
     def _sparse_decode_csr(self, z: torch.Tensor) -> torch.Tensor:
-        """Per-layer CSR sparse matmul decode (non-cross-layer only)."""
+        """Per-layer CSR sparse matmul decode (non-cross-layer only).
+
+        NOTE: float32-only. torch.sparse.mm (sampled_addmm) has no bfloat16
+        kernel, so this path cannot be used in the bf16 dtype that real training
+        uses -- use sparse_decode='gather' there. We raise early with a clear
+        message instead of letting torch fail deep inside the loop.
+        """
+        if z.dtype not in (torch.float32, torch.float64):
+            raise ValueError(
+                f"CSR sparse decode requires float32/float64 (torch.sparse.mm has no "
+                f"{z.dtype} kernel). Use sparse_decode='gather' for {z.dtype}."
+            )
         B, N, K = z.shape
         D = self.d_in
 
