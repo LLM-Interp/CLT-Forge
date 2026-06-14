@@ -52,6 +52,33 @@ def test_gather_matches_dense(cross_layer, density):
     torch.testing.assert_close(out_sparse, out_dense, atol=1e-5, rtol=1e-5)
 
 
+# bf16 is the dtype used in real training. The dense path (einsum) and the gather
+# path (index_add) accumulate in different orders, so they differ by up to one bf16
+# mantissa ULP (2**-8 ~= 3.9e-3 at magnitude ~1) -- a floating-point artifact, not a
+# bug. Calibrated worst-case over 8 seeds x 4 densities x both modes was 3.91e-3, so
+# we assert an absolute tolerance with ~5x headroom. rtol is unusable here: many
+# decode outputs are near zero, where relative error explodes (~1e3) on pure rounding.
+BF16_ATOL = 2e-2
+
+
+@pytest.mark.parametrize("cross_layer", [False, True])
+def test_gather_matches_dense_bf16(cross_layer):
+    clt_dense = _make_clt(cross_layer, sparse_decode="dense", dtype="bfloat16")
+    clt_sparse = _make_clt(cross_layer, sparse_decode="gather", dtype="bfloat16")
+    clt_sparse.load_state_dict(clt_dense.state_dict(), strict=False)
+
+    z = _make_sparse_z(
+        8, clt_dense.N_layers, clt_dense.local_d_latent,
+        density=0.05, dtype=torch.bfloat16,
+    )
+
+    with torch.no_grad():
+        out_dense = clt_dense.decode(z)
+        out_sparse = clt_sparse.decode(z)
+
+    torch.testing.assert_close(out_sparse, out_dense, atol=BF16_ATOL, rtol=0)
+
+
 @pytest.mark.parametrize("density", [0.01, 0.05, 0.10])
 def test_csr_matches_dense(density):
     clt_dense = _make_clt(False, sparse_decode="dense")
