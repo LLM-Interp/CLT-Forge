@@ -219,6 +219,20 @@ class CLT(nn.Module):
         """
 
         if layer is None:
+            method = self._resolve_decode_method(z)
+            if method == "gather":
+                if self.cfg.cross_layer_decoders:
+                    return self._sparse_decode_gather_cross_layer(z)
+                return self._sparse_decode_gather(z)
+            elif method == "csr":
+                if self.cfg.cross_layer_decoders:
+                    raise ValueError(
+                        "CSR sparse decode is not supported with cross_layer_decoders=True. "
+                        "Use sparse_decode='gather' instead."
+                    )
+                return self._sparse_decode_csr(z)
+
+            # Dense path (method == "dense")
             if self.cfg.cross_layer_decoders:
                 B = z.shape[0]
                 z_sel = z.index_select(1, self.l_idx)  # select source layers
@@ -231,7 +245,7 @@ class CLT(nn.Module):
                 if self.cfg.is_sharded: # ideally only used for training
                     out = out.contiguous()
                     out = all_reduce(out, op=dist.ReduceOp.SUM)
-                
+
                 # Add bias after aggregation (not inside sharded block)
                 b_contrib = torch.zeros(1, self.N_layers, self.d_in, dtype=contrib.dtype, device=contrib.device)
                 b_contrib = b_contrib.index_add(1, self.k_idx, self.b_dec.unsqueeze(0))
@@ -239,11 +253,11 @@ class CLT(nn.Module):
 
             else:
                 out = torch.einsum("bnk,nkd->bnd", z, self.W_dec)  # [B, N_layers, d_in]
-                
+
                 if self.cfg.is_sharded:
                     out = out.contiguous()
                     out = all_reduce(out, op=dist.ReduceOp.SUM)
-                
+
                 # Add bias after aggregation (not inside sharded block)
                 out = out + self.b_dec.to(out.dtype).unsqueeze(0)
 
@@ -259,6 +273,98 @@ class CLT(nn.Module):
             else:
                 out = z @ self.W_dec[layer] + self.b_dec[layer]
 
+        return out
+
+    def _resolve_decode_method(self, z: torch.Tensor) -> str:
+        method = self.cfg.sparse_decode
+        if method != "auto":
+            return method
+        sparsity = 1.0 - (z.count_nonzero().item() / max(z.numel(), 1))
+        return "gather" if sparsity >= self.cfg.sparse_threshold else "dense"
+
+    def _sparse_decode_gather(self, z: torch.Tensor) -> torch.Tensor:
+        """Gather-based sparse decode (non-cross-layer). Like an embedding lookup
+        over active features followed by weighted scatter."""
+        B, N, K = z.shape
+        D = self.d_in
+
+        nz = z.nonzero(as_tuple=False)  # [nnz, 3]
+        if nz.shape[0] == 0:
+            out = torch.zeros(B, N, D, dtype=z.dtype, device=z.device)
+            if self.cfg.is_sharded:
+                out = all_reduce(out, op=dist.ReduceOp.SUM)
+            return out + self.b_dec.to(out.dtype).unsqueeze(0)
+
+        b_idx, n_idx, k_idx = nz[:, 0], nz[:, 1], nz[:, 2]
+        vals = z[b_idx, n_idx, k_idx]                   # [nnz]
+        dec_rows = self.W_dec[n_idx, k_idx]              # [nnz, D]
+        weighted = vals.unsqueeze(-1) * dec_rows          # [nnz, D]
+
+        flat_idx = b_idx * N + n_idx
+        out = torch.zeros(B * N, D, dtype=z.dtype, device=z.device)
+        out.index_add_(0, flat_idx, weighted)
+        out = out.reshape(B, N, D)
+
+        if self.cfg.is_sharded:
+            out = out.contiguous()
+            out = all_reduce(out, op=dist.ReduceOp.SUM)
+
+        out = out + self.b_dec.to(out.dtype).unsqueeze(0)
+        return out
+
+    def _sparse_decode_gather_cross_layer(self, z: torch.Tensor) -> torch.Tensor:
+        """Gather-based sparse decode for cross-layer mode. Scatters decoder
+        contributions directly to target layers via k_idx mapping."""
+        B = z.shape[0]
+        D = self.d_in
+
+        z_sel = z.index_select(1, self.l_idx)  # [B, N_dec, local_d_latent]
+        nz = z_sel.nonzero(as_tuple=False)      # [nnz, 3]
+
+        if nz.shape[0] == 0:
+            out = torch.zeros(B, self.N_layers, D, dtype=z.dtype, device=z.device)
+            if self.cfg.is_sharded:
+                out = all_reduce(out, op=dist.ReduceOp.SUM)
+            b_contrib = torch.zeros(1, self.N_layers, D, dtype=z.dtype, device=z.device)
+            b_contrib = b_contrib.index_add(1, self.k_idx, self.b_dec.unsqueeze(0))
+            return out + b_contrib
+
+        b_idx, dec_idx, k_idx = nz[:, 0], nz[:, 1], nz[:, 2]
+        vals = z_sel[b_idx, dec_idx, k_idx]             # [nnz]
+        dec_rows = self.W_dec[dec_idx, k_idx]            # [nnz, D]
+        weighted = vals.unsqueeze(-1) * dec_rows          # [nnz, D]
+
+        target_layer = self.k_idx[dec_idx]
+        flat_idx = b_idx * self.N_layers + target_layer
+        out = torch.zeros(B * self.N_layers, D, dtype=z.dtype, device=z.device)
+        out.index_add_(0, flat_idx, weighted)
+        out = out.reshape(B, self.N_layers, D)
+
+        if self.cfg.is_sharded:
+            out = out.contiguous()
+            out = all_reduce(out, op=dist.ReduceOp.SUM)
+
+        b_contrib = torch.zeros(1, self.N_layers, D, dtype=z.dtype, device=z.device)
+        b_contrib = b_contrib.index_add(1, self.k_idx, self.b_dec.unsqueeze(0))
+        out = out + b_contrib
+        return out
+
+    def _sparse_decode_csr(self, z: torch.Tensor) -> torch.Tensor:
+        """Per-layer CSR sparse matmul decode (non-cross-layer only)."""
+        B, N, K = z.shape
+        D = self.d_in
+
+        out = torch.zeros(B, N, D, dtype=z.dtype, device=z.device)
+        for n in range(N):
+            z_layer = z[:, n, :]  # [B, K]
+            z_sparse = z_layer.to_sparse_csr()
+            out[:, n, :] = torch.sparse.mm(z_sparse, self.W_dec[n])
+
+        if self.cfg.is_sharded:
+            out = out.contiguous()
+            out = all_reduce(out, op=dist.ReduceOp.SUM)
+
+        out = out + self.b_dec.to(out.dtype).unsqueeze(0)
         return out
 
     def forward_eval(
