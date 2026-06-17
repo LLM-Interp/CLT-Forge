@@ -113,6 +113,11 @@ def main():
     print(f"forced sparsity: density={ach:.5f} (sparsity={1-ach:.5f}), "
           f"~L0/layer={ach*args.d_latent:.1f}")
 
+    # precompute a sparse feat_act to feed decode-only timings
+    with torch.no_grad():
+        feat0, _ = dense.encode(act_in)
+
+    # ---- TRAINING (fwd+bwd) timers ----
     def full_step(model):
         def f():
             model.zero_grad(set_to_none=True)
@@ -120,8 +125,13 @@ def main():
             (m.mse_loss + m.l0_loss + m.dead_feature_loss).backward()
         return f
 
-    def decode_only(model):
-        feat0, _ = model.encode(act_in)
+    def encode_train(model):
+        def f():
+            model.zero_grad(set_to_none=True)
+            model.encode(act_in)[0].float().pow(2).sum().backward()
+        return f
+
+    def decode_train(model):
         z = feat0.detach().clone().requires_grad_(True)
         def f():
             model.zero_grad(set_to_none=True)
@@ -129,24 +139,54 @@ def main():
             model.decode(z).float().pow(2).sum().backward()
         return f
 
-    res = {}
+    # ---- INFERENCE (fwd only) timers ----
+    def encode_infer(model):
+        def f():
+            with torch.no_grad():
+                model.encode(act_in)
+        return f
+
+    def decode_infer(model):
+        z = feat0.detach()
+        def f():
+            with torch.no_grad():
+                model.decode(z)
+        return f
+
+    def full_infer(model):
+        def f():
+            with torch.no_grad():
+                feat, _ = model.encode(act_in)
+                model.decode(feat)
+        return f
+
+    T = {}
     for name, m in [("dense", dense), ("gather", gather)]:
-        res[name] = {
-            "step_ms": time_call(full_step(m), args.device),
-            "decode_ms": time_call(decode_only(m), args.device),
+        T[name] = {
+            "step":       time_call(full_step(m),    args.device),
+            "enc_tr":     time_call(encode_train(m), args.device),
+            "dec_tr":     time_call(decode_train(m), args.device),
+            "inf":        time_call(full_infer(m),   args.device),
+            "enc_inf":    time_call(encode_infer(m), args.device),
+            "dec_inf":    time_call(decode_infer(m), args.device),
         }
 
-    print(f"\n{'':>8} {'full step (ms)':>16} {'decode-only (ms)':>18} {'decode share':>14}")
-    for name in ("dense", "gather"):
-        r = res[name]
-        share = r["decode_ms"] / r["step_ms"] if r["step_ms"] else float("nan")
-        print(f"{name:>8} {r['step_ms']:>16.2f} {r['decode_ms']:>18.2f} {share:>13.1%}")
+    d = T["dense"]
+    print("\n================ TRAINING step (fwd+bwd) ================")
+    print(f"  full step      : {d['step']:.2f} ms")
+    print(f"  encode-only    : {d['enc_tr']:.2f} ms  ({d['enc_tr']/d['step']:.1%})")
+    print(f"  decode-only    : {d['dec_tr']:.2f} ms  ({d['dec_tr']/d['step']:.1%})  <- only this is sparsifiable")
+    other = d['step'] - d['enc_tr'] - d['dec_tr']
+    print(f"  other(JumpReLU+loss+penalty) ~ {other:.2f} ms  ({other/d['step']:.1%})")
+    print(f"  => END-TO-END training-step speedup (gather): {d['step']/T['gather']['step']:.2f}x")
 
-    step_speedup = res["dense"]["step_ms"] / res["gather"]["step_ms"]
-    decode_speedup = res["dense"]["decode_ms"] / res["gather"]["decode_ms"]
-    print(f"\nDECODE-OP speedup (gather vs dense):     {decode_speedup:.2f}x")
-    print(f"END-TO-END TRAINING-STEP speedup:        {step_speedup:.2f}x")
-    print("(end-to-end < decode-op because encode + loss are unchanged -- Amdahl.)")
+    print("\n================ INFERENCE (forward only) ================")
+    print(f"  full inference : {d['inf']:.2f} ms")
+    print(f"  encode-only    : {d['enc_inf']:.2f} ms  ({d['enc_inf']/d['inf']:.1%})")
+    print(f"  decode-only    : {d['dec_inf']:.2f} ms (dense) / {T['gather']['dec_inf']:.2f} ms (gather)"
+          f"  ({d['dec_inf']/d['inf']:.1%} of inference)")
+    print(f"  => END-TO-END inference speedup (gather):     {d['inf']/T['gather']['inf']:.2f}x")
+    print(f"  => decode-op inference speedup (gather):       {d['dec_inf']/T['gather']['dec_inf']:.2f}x")
 
 
 if __name__ == "__main__":
