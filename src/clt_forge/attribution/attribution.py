@@ -1,7 +1,10 @@
 from clt_forge import logger
 
+from clt_forge.attribution.conversion import build_clt_forge_attribution_result
 from clt_forge.attribution.loading import (
-    load_circuit_tracing_clt_from_local,
+    CircuitTracerCLTSource,
+    _resolve_torch_dtype,
+    load_attribution_clt,
     test_clt_performance_on_prompt,
     compare_reconstruction_with_local_clt_class,
 )
@@ -15,15 +18,27 @@ from clt_forge.vendor.circuit_tracer.circuit_tracer.graph import prune_graph, co
 
 import os
 import torch
-from typing import List, Dict, Any
+from typing import Any, Dict, List, Literal
 
 class AttributionRunner:
     def __init__(
         self,
-        clt_checkpoint: str,
+        clt_checkpoint: str | None = None,
         model_name: str = "gpt2",
         device: str = "cuda",
+        dtype: str | torch.dtype = torch.float32,
+        backend: Literal["nnsight", "transformerlens"] = "transformerlens",
+        clt_source: CircuitTracerCLTSource = "clt_forge",
+        circuit_tracer_clt: str | None = None,
+        lazy_encoder: bool = False,
+        lazy_decoder: bool = True,
+        cache_dir: str | None = None,
+        use_cache: bool = True,
+        feature_input_hook: str = "hook_resid_mid",
+        feature_output_hook: str = "hook_mlp_out",
+        scan: str | list[str] | None = None,
         debug: bool = False,
+        model_kwargs: Dict[str, Any] | None = None,
     ):
         self.debug = debug
 
@@ -32,49 +47,105 @@ class AttributionRunner:
                 logger.info(msg)
 
         self.log = log
+        torch_dtype = _resolve_torch_dtype(dtype)
+
+        clt_ref = circuit_tracer_clt or clt_checkpoint
+        if clt_ref is None:
+            raise ValueError(
+                "Pass clt_checkpoint for CLT-Forge checkpoints or "
+                "circuit_tracer_clt for circuit-tracer CLTs."
+            )
 
         self.log("Loading CLT...")
-        self.clt = load_circuit_tracing_clt_from_local(
-            clt_checkpoint, device=device, debug=debug
+        self.clt = load_attribution_clt(
+            clt_ref=clt_ref,
+            source=clt_source,
+            device=device,
+            dtype=torch_dtype,
+            lazy_encoder=lazy_encoder,
+            lazy_decoder=lazy_decoder,
+            cache_dir=cache_dir,
+            use_cache=use_cache,
+            feature_input_hook=feature_input_hook,
+            feature_output_hook=feature_output_hook,
+            scan=scan,
+            debug=debug,
         )
 
         self.log("Loading model...")
         self.model = ReplacementModel.from_pretrained_and_transcoders(
             model_name=model_name,
             transcoders=self.clt,
+            backend=backend,
+            device=torch.device(device),
+            dtype=torch_dtype,
+            **(model_kwargs or {}),
         )
 
         self.clt_checkpoint = clt_checkpoint
+        self.clt_ref = clt_ref
+        self.clt_source = clt_source
         self.model_name = model_name
+        self.backend = backend
 
-    def _build_result(self, graph, prune_result, input_string) -> Dict[str, Any]:
-        sparse_adjacency = prune_result.edge_mask.float()
-
-        active_feature = torch.stack(
-            [
-                graph.active_features[:, 1],
-                graph.active_features[:, 0],
-                graph.active_features[:, 2],
-            ],
-            dim=1,
+    @classmethod
+    def from_circuit_tracer_hub(
+        cls,
+        hf_ref: str,
+        model_name: str,
+        **kwargs: Any,
+    ) -> "AttributionRunner":
+        """Create a runner from an open-source circuit-tracer CLT on HuggingFace."""
+        return cls(
+            model_name=model_name,
+            clt_source="circuit_tracer_hub",
+            circuit_tracer_clt=hf_ref,
+            **kwargs,
         )
 
-        token_string = [self.model.tokenizer.decode(t) for t in graph.input_tokens]
-        logit_token_strings = [self.model.tokenizer.decode(t) for t in graph.logit_tokens]
+    @classmethod
+    def from_circuit_tracer_local(
+        cls,
+        clt_path: str,
+        model_name: str,
+        **kwargs: Any,
+    ) -> "AttributionRunner":
+        """Create a runner from a local circuit-tracer safetensors CLT directory."""
+        return cls(
+            model_name=model_name,
+            clt_source="circuit_tracer_local",
+            circuit_tracer_clt=clt_path,
+            **kwargs,
+        )
 
-        return {
-            "adjacency_matrix": graph.adjacency_matrix.cpu(),
-            "feature_indices": active_feature.cpu(),
-            "sparse_pruned_adj": sparse_adjacency.cpu(),
-            "feature_mask": prune_result.node_mask.cpu(),
-            "edge_mask": prune_result.edge_mask.cpu(),
-            "logit_tokens": graph.logit_tokens.cpu(),
-            "logit_probabilities": graph.logit_probabilities.cpu(),
-            "input_tokens": graph.input_tokens.cpu(),
-            "input_string": input_string,
-            "token_string": token_string,
-            "logit_token_strings": logit_token_strings,
-        }
+    @classmethod
+    def from_circuit_tracer_cache(
+        cls,
+        hf_ref: str,
+        model_name: str,
+        **kwargs: Any,
+    ) -> "AttributionRunner":
+        """Create a runner from a circuit-tracer CLT already saved in local cache."""
+        return cls(
+            model_name=model_name,
+            clt_source="circuit_tracer_cache",
+            circuit_tracer_clt=hf_ref,
+            **kwargs,
+        )
+
+    def _build_result(self, graph, prune_result, input_string) -> Dict[str, Any]:
+        return build_clt_forge_attribution_result(
+            graph=graph,
+            prune_result=prune_result,
+            tokenizer=self.model.tokenizer,
+            input_string=input_string,
+            metadata={
+                "clt_source": self.clt_source,
+                "clt_ref": self.clt_ref,
+                "model_name": self.model_name,
+                "backend": self.backend,
+            },
+        )
 
     def run(
         self,
@@ -101,14 +172,15 @@ class AttributionRunner:
                 input_string, self.clt, self.model, debug=self.debug
             )
 
-            compare_reconstruction_with_local_clt_class(
-                self.clt_checkpoint,
-                input_string,
-                self.clt,
-                self.model,
-                self.model_name,
-                debug=self.debug,
-            )
+            if self.clt_source == "clt_forge" and self.clt_checkpoint is not None:
+                compare_reconstruction_with_local_clt_class(
+                    self.clt_checkpoint,
+                    input_string,
+                    self.clt,
+                    self.model,
+                    self.model_name,
+                    debug=self.debug,
+                )
 
         graph = attribute(
             prompt=input_string,
@@ -135,7 +207,7 @@ class AttributionRunner:
         if self.debug:
             self.log(f"Sparse adjacency shape: {prune_result.edge_mask.shape}")
 
-        n_features = graph.active_features.shape[0]
+        n_features = graph.selected_features.shape[0]
         self.log(f"Number of features before pruning: {n_features}")
         self.log(f"Number of feature after pruning (not counting error nodes): {prune_result.node_mask[:n_features].sum().item()}")
 

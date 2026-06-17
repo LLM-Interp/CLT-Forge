@@ -1,9 +1,41 @@
-import torch
 from pathlib import Path
+from importlib import import_module
+from typing import Literal
+
+import torch
+
 from clt_forge import logger
 from clt_forge.clt import CLT
-from clt_forge.vendor.circuit_tracer.circuit_tracer.transcoder.cross_layer_transcoder import CrossLayerTranscoder
+from clt_forge.utils import DTYPE_MAP
 from clt_forge.vendor.circuit_tracer.circuit_tracer import ReplacementModel
+from clt_forge.vendor.circuit_tracer.circuit_tracer.transcoder.cross_layer_transcoder import (
+    CrossLayerTranscoder,
+    load_clt,
+)
+
+CircuitTracerCLTSource = Literal[
+    "clt_forge",
+    "circuit_tracer_hub",
+    "circuit_tracer_local",
+    "circuit_tracer_cache",
+]
+
+
+def _resolve_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    try:
+        return DTYPE_MAP[dtype]
+    except KeyError as exc:
+        allowed = ", ".join(sorted(DTYPE_MAP))
+        raise ValueError(f"Unknown dtype {dtype!r}. Expected one of: {allowed}") from exc
+
+
+def _resolve_torch_device(device: str | torch.device | None) -> torch.device | None:
+    if device is None or isinstance(device, torch.device):
+        return device
+    return torch.device(device)
+
 
 def load_circuit_tracing_clt_from_local(
     clt_checkpoint: str,
@@ -103,6 +135,199 @@ def load_circuit_tracing_clt_from_local(
     log(f"  Instance b_dec dtype: {instance.b_dec.dtype}")
 
     return instance
+
+
+def load_clt_forge_checkpoint_as_circuit_tracer_clt(
+    clt_checkpoint: str,
+    device: str = "cuda",
+    debug: bool = False,
+) -> CrossLayerTranscoder:
+    """Alias for the historical CLT-Forge-checkpoint-to-circuit-tracer loader."""
+    return load_circuit_tracing_clt_from_local(
+        clt_checkpoint=clt_checkpoint,
+        device=device,
+        debug=debug,
+    )
+
+
+def load_circuit_tracer_clt_from_hub(
+    hf_ref: str,
+    device: str | torch.device | None = "cuda",
+    dtype: str | torch.dtype = torch.float32,
+    lazy_encoder: bool = False,
+    lazy_decoder: bool = True,
+    cache_dir: str | None = None,
+    use_cache: bool = True,
+    debug: bool = False,
+) -> CrossLayerTranscoder:
+    """Load an open-source circuit-tracer CLT from HuggingFace.
+
+    ``hf_ref`` can be any reference accepted by circuit-tracer, including
+    repository IDs, ``repo/subfolder@revision`` references, and the circuit-tracer
+    convenience aliases.
+    """
+    torch_device = _resolve_torch_device(device)
+    torch_dtype = _resolve_torch_dtype(dtype)
+
+    if debug:
+        logger.info(
+            "Loading circuit-tracer CLT from HuggingFace: "
+            f"{hf_ref} ({torch_device=}, {torch_dtype=})"
+        )
+
+    load_transcoder_from_hub = getattr(
+        import_module("clt_forge.vendor.circuit_tracer.circuit_tracer.utils.hf_utils"),
+        "load_transcoder_from_hub",
+    )
+    transcoders, _ = load_transcoder_from_hub(
+        hf_ref=hf_ref,
+        device=torch_device,
+        dtype=torch_dtype,
+        lazy_encoder=lazy_encoder,
+        lazy_decoder=lazy_decoder,
+        cache_dir=cache_dir,
+        use_cache=use_cache,
+    )
+
+    if not isinstance(transcoders, CrossLayerTranscoder):
+        raise TypeError(
+            "Expected a circuit-tracer CrossLayerTranscoder, but "
+            f"{hf_ref!r} loaded {type(transcoders).__name__}. "
+            "Use a circuit-tracer CLT repo rather than a per-layer transcoder set."
+        )
+
+    return transcoders
+
+
+def load_circuit_tracer_clt_from_local_safetensors(
+    clt_path: str,
+    device: str | torch.device | None = "cuda",
+    dtype: str | torch.dtype = torch.float32,
+    lazy_encoder: bool = False,
+    lazy_decoder: bool = True,
+    feature_input_hook: str = "hook_resid_mid",
+    feature_output_hook: str = "hook_mlp_out",
+    scan: str | list[str] | None = None,
+    debug: bool = False,
+) -> CrossLayerTranscoder:
+    """Load a circuit-tracer CLT already saved in safetensors directory format."""
+    torch_device = _resolve_torch_device(device)
+    torch_dtype = _resolve_torch_dtype(dtype)
+
+    if debug:
+        logger.info(
+            "Loading circuit-tracer CLT from local safetensors: "
+            f"{clt_path} ({torch_device=}, {torch_dtype=})"
+        )
+
+    return load_clt(
+        clt_path=clt_path,
+        device=torch_device,
+        dtype=torch_dtype,
+        lazy_encoder=lazy_encoder,
+        lazy_decoder=lazy_decoder,
+        feature_input_hook=feature_input_hook,
+        feature_output_hook=feature_output_hook,
+        scan=scan,
+    )
+
+
+def load_circuit_tracer_clt_from_cache(
+    hf_ref: str,
+    device: str | torch.device | None = "cuda",
+    dtype: str | torch.dtype = torch.float32,
+    lazy_encoder: bool = False,
+    lazy_decoder: bool = True,
+    cache_dir: str | None = None,
+    debug: bool = False,
+) -> CrossLayerTranscoder:
+    """Load a circuit-tracer CLT from circuit-tracer's local cache."""
+    torch_device = _resolve_torch_device(device)
+    torch_dtype = _resolve_torch_dtype(dtype)
+
+    if debug:
+        logger.info(
+            "Loading circuit-tracer CLT from cache: "
+            f"{hf_ref} ({torch_device=}, {torch_dtype=})"
+        )
+
+    load_transcoders_from_cache = getattr(
+        import_module("clt_forge.vendor.circuit_tracer.circuit_tracer.utils.caching"),
+        "load_transcoders_from_cache",
+    )
+    transcoders, _ = load_transcoders_from_cache(
+        hf_ref=hf_ref,
+        cache_dir=cache_dir,
+        device=torch_device,
+        dtype=torch_dtype,
+        lazy_encoder=lazy_encoder,
+        lazy_decoder=lazy_decoder,
+    )
+
+    if not isinstance(transcoders, CrossLayerTranscoder):
+        raise TypeError(
+            "Expected a cached circuit-tracer CrossLayerTranscoder, but "
+            f"{hf_ref!r} loaded {type(transcoders).__name__}."
+        )
+
+    return transcoders
+
+
+def load_attribution_clt(
+    clt_ref: str,
+    source: CircuitTracerCLTSource = "clt_forge",
+    device: str | torch.device | None = "cuda",
+    dtype: str | torch.dtype = torch.float32,
+    lazy_encoder: bool = False,
+    lazy_decoder: bool = True,
+    cache_dir: str | None = None,
+    use_cache: bool = True,
+    feature_input_hook: str = "hook_resid_mid",
+    feature_output_hook: str = "hook_mlp_out",
+    scan: str | list[str] | None = None,
+    debug: bool = False,
+) -> CrossLayerTranscoder:
+    """Load a CLT object suitable for circuit-tracer attribution."""
+    if source == "clt_forge":
+        return load_circuit_tracing_clt_from_local(
+            clt_checkpoint=clt_ref,
+            device=str(device or "cpu"),
+            debug=debug,
+        )
+    if source == "circuit_tracer_hub":
+        return load_circuit_tracer_clt_from_hub(
+            hf_ref=clt_ref,
+            device=device,
+            dtype=dtype,
+            lazy_encoder=lazy_encoder,
+            lazy_decoder=lazy_decoder,
+            cache_dir=cache_dir,
+            use_cache=use_cache,
+            debug=debug,
+        )
+    if source == "circuit_tracer_local":
+        return load_circuit_tracer_clt_from_local_safetensors(
+            clt_path=clt_ref,
+            device=device,
+            dtype=dtype,
+            lazy_encoder=lazy_encoder,
+            lazy_decoder=lazy_decoder,
+            feature_input_hook=feature_input_hook,
+            feature_output_hook=feature_output_hook,
+            scan=scan,
+            debug=debug,
+        )
+    if source == "circuit_tracer_cache":
+        return load_circuit_tracer_clt_from_cache(
+            hf_ref=clt_ref,
+            device=device,
+            dtype=dtype,
+            lazy_encoder=lazy_encoder,
+            lazy_decoder=lazy_decoder,
+            cache_dir=cache_dir,
+            debug=debug,
+        )
+    raise ValueError(f"Unknown CLT source: {source}")
 
 
 def test_clt_performance_on_prompt(
