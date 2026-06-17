@@ -19,6 +19,7 @@ class AutoInterpConfig(BaseModel):
     # ---- Dataset ----
     dataset_path: str = "" # HuggingFace path or local path
     is_dataset_tokenized: bool = True
+    dataset_text_column: str = "text"
     split: str = "train" # dataset split passed to load_dataset
     disk: bool = False  # use load_from_disk instead of load_dataset
     is_multilingual_split_dataset: bool = False  # only for multilingual setups

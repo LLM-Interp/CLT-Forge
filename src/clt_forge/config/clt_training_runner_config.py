@@ -24,6 +24,7 @@ class CLTTrainingRunnerConfig(BaseModel):
     model_from_pretrained_kwargs: Optional[Dict[str, Any]] = None
     dataset_path: str = "" # Hugging face path
     is_dataset_tokenized: bool = True
+    dataset_text_column: str = "text"
     is_multilingual_split_dataset: bool = False # can be ignored, it is only for multilingual datasets processing
     split: str = "train"
     disk: bool = False # use load_from_disk instead and local dataset

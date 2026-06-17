@@ -34,6 +34,10 @@ model = load_model("meta-llama/Llama-3.2-1B", device="cuda")
 # Create config
 cfg = clt_training_runner_config()
 
+# To use raw-text datasets instead of pre-tokenized input:
+# cfg.is_dataset_tokenized = False
+# cfg.dataset_text_column = "text"
+
 # Create activation store
 store = ActivationsStore(model, cfg)
 
