@@ -7,8 +7,9 @@ import torch
 from clt_forge import logger
 from clt_forge.clt import CLT
 from clt_forge.utils import DTYPE_MAP
-from clt_forge.vendor.circuit_tracer.circuit_tracer import ReplacementModel
-from clt_forge.vendor.circuit_tracer.circuit_tracer.transcoder.cross_layer_transcoder import (
+import clt_forge.vendor.circuit_tracer  # noqa: F401
+from circuit_tracer import ReplacementModel
+from circuit_tracer.transcoder.cross_layer_transcoder import (
     CrossLayerTranscoder,
     load_clt,
 )
@@ -176,7 +177,7 @@ def load_circuit_tracer_clt_from_hub(
         )
 
     load_transcoder_from_hub = getattr(
-        import_module("clt_forge.vendor.circuit_tracer.circuit_tracer.utils.hf_utils"),
+        import_module("circuit_tracer.utils.hf_utils"),
         "load_transcoder_from_hub",
     )
     transcoders, _ = load_transcoder_from_hub(
@@ -252,7 +253,7 @@ def load_circuit_tracer_clt_from_cache(
         )
 
     load_transcoders_from_cache = getattr(
-        import_module("clt_forge.vendor.circuit_tracer.circuit_tracer.utils.caching"),
+        import_module("circuit_tracer.utils.caching"),
         "load_transcoders_from_cache",
     )
     transcoders, _ = load_transcoders_from_cache(

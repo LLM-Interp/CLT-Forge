@@ -13,8 +13,9 @@ from clt_forge.attribution.intervention import (
     run_intervention_per_feature,
 )
 
-from clt_forge.vendor.circuit_tracer.circuit_tracer import ReplacementModel, attribute
-from clt_forge.vendor.circuit_tracer.circuit_tracer.graph import prune_graph, compute_graph_scores
+import clt_forge.vendor.circuit_tracer  # noqa: F401
+from circuit_tracer import ReplacementModel, attribute
+from circuit_tracer.graph import prune_graph, compute_graph_scores
 
 import os
 import torch

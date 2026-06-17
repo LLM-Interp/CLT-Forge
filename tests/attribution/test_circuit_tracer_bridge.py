@@ -19,9 +19,10 @@ from clt_forge.attribution.conversion import build_clt_forge_attribution_result
 from clt_forge.attribution.loading import load_circuit_tracer_clt_from_hub
 from clt_forge.frontend.config.settings import AppConfig
 from clt_forge.frontend.data.loaders import DataLoader
-from clt_forge.vendor.circuit_tracer.circuit_tracer.attribution.targets import LogitTarget
-from clt_forge.vendor.circuit_tracer.circuit_tracer.graph import Graph, PruneResult
-from clt_forge.vendor.circuit_tracer.circuit_tracer.transcoder.cross_layer_transcoder import (
+import clt_forge.vendor.circuit_tracer  # noqa: F401
+from circuit_tracer.attribution.targets import LogitTarget
+from circuit_tracer.graph import Graph, PruneResult
+from circuit_tracer.transcoder.cross_layer_transcoder import (
     CrossLayerTranscoder,
 )
 from circuit_tracer.utils.tl_nnsight_mapping import UnifiedConfig
@@ -235,7 +236,7 @@ def test_hub_loader_returns_cross_layer_transcoder(monkeypatch: pytest.MonkeyPat
         return clt, {"model_kind": "cross_layer_transcoder"}
 
     def fake_import_module(name):
-        assert name == "clt_forge.vendor.circuit_tracer.circuit_tracer.utils.hf_utils"
+        assert name == "circuit_tracer.utils.hf_utils"
         return SimpleNamespace(load_transcoder_from_hub=fake_load_transcoder_from_hub)
 
     monkeypatch.setattr("clt_forge.attribution.loading.import_module", fake_import_module)

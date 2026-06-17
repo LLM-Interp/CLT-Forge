@@ -3,7 +3,8 @@ from typing import Any, Dict
 
 import torch
 
-from clt_forge.vendor.circuit_tracer.circuit_tracer.graph import (
+import clt_forge.vendor.circuit_tracer  # noqa: F401
+from circuit_tracer.graph import (
     Graph,
     PruneResult,
     prune_graph,
