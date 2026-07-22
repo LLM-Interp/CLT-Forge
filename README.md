@@ -21,6 +21,14 @@
 
 We believe that a major limitation in the development of CLTs and transcoders, and more broadly attribution graph methods, is the significant engineering effort required to train, analyze, and iterate on them. This library aims to reduce that overhead by providing a clean, scalable, and extensible framework for academia.
 
+If you want to get started and get a flavour of the library, try the tutorial notebook — trains a small CLT on GPT-2 + TinyStories and runs on a free-tier T4/L4 GPU:
+
+<p align="center">
+  <a href="https://colab.research.google.com/github/LLM-Interp/CLT-Forge/blob/master/clt-forge-tutorial.ipynb">
+    <img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab">
+  </a>
+</p>
+
 ## Quick Start
 
 ### 1. Generate and cache activations
