@@ -13,7 +13,7 @@ from typing import Union, Optional, Dict
 
 from clt_forge.config import CLTConfig
 from clt_forge.utils import DTYPE_MAP, CLT_WEIGHTS_FILENAME, CLT_CFG_FILENAME
-from clt_forge.training.optim import JumpReLU
+from clt_forge.training.optim import JumpReLU, fused_encoder
 from clt_forge import logger
 
 C_l0_COEF = 4
@@ -97,6 +97,8 @@ class CLT(nn.Module):
         self.log_threshold = nn.Parameter(
             torch.full((self.N_layers, self.local_d_latent), math.log(cfg.jumprelu_init_threshold), dtype=self.dtype, device=init_device)
         )
+        if cfg.activation_fn != "jumprelu":
+            self.log_threshold.requires_grad = False
         self.bandwidth = cfg.jumprelu_bandwidth
 
         self.register_buffer('feature_count', 
@@ -153,7 +155,7 @@ class CLT(nn.Module):
                 for feature in range(self.local_d_latent):
                     feature_pre_acts = hidden_pre[:, layer, feature]  # [B]
                     sorted_acts, _ = torch.sort(feature_pre_acts, descending=True)
-                    target_idx = int(target_activation_rate * B) + 1
+                    target_idx = min(int(target_activation_rate * B) + 1, B - 1)
                     threshold_value = sorted_acts[target_idx]
                     required_bias = thresh[layer, feature] - threshold_value
                     
@@ -182,24 +184,40 @@ class CLT(nn.Module):
         output: tuple([B, N_layers, local_d_latent], [B, N_layers, local_d_latent]) if layer is None, else [B, local_d_latent]
         """
 
-        if layer is None: 
-            hidden_pre = (torch.einsum( # double check einsum and autocast
-                "bnd,ndk->bnk",
-                x,
-                self.W_enc,
-            ) + self.b_enc)
-
-            thresh = torch.exp(self.log_threshold) #shape [N_layers, d_latent]
-        else: 
-            assert 0 <= layer < self.N_layers, f"Layer {layer} out of range"
-            hidden_pre = F.linear(
-                x,
-                self.W_enc[layer].T,
-                self.b_enc[layer]
-            )            
-            thresh = torch.exp(self.log_threshold[layer]) 
-        
-        feat_act = JumpReLU.apply(hidden_pre, thresh, self.bandwidth)
+        if self.cfg.activation_fn in ["topk", "groupmax"]:
+            assert self.cfg.k is not None, f"k must be specified in config for {self.cfg.activation_fn} activation"
+            if layer is None:
+                weight = self.W_enc
+                bias = self.b_enc
+            else:
+                assert 0 <= layer < self.N_layers, f"Layer {layer} out of range"
+                weight = self.W_enc[layer]
+                bias = self.b_enc[layer]
+            
+            values, indices, preacts = fused_encoder(x, weight, bias, self.cfg.k, self.cfg.activation_fn)
+            feat_act = torch.zeros_like(preacts)
+            feat_act.scatter_(-1, indices, values)
+            hidden_pre = preacts
+        elif self.cfg.activation_fn == "jumprelu":
+            if layer is None: 
+                hidden_pre = (torch.einsum(
+                    "bnd,ndk->bnk",
+                    x,
+                    self.W_enc,
+                ) + self.b_enc)
+                thresh = torch.exp(self.log_threshold)
+            else: 
+                assert 0 <= layer < self.N_layers, f"Layer {layer} out of range"
+                hidden_pre = F.linear(
+                    x,
+                    self.W_enc[layer].T,
+                    self.b_enc[layer]
+                )            
+                thresh = torch.exp(self.log_threshold[layer])
+            
+            feat_act = JumpReLU.apply(hidden_pre, thresh, self.bandwidth)
+        else:
+            raise ValueError(f"Unsupported activation_fn: {self.cfg.activation_fn}")
         return feat_act, hidden_pre
 
     def decode(
@@ -422,36 +440,41 @@ class CLT(nn.Module):
         mse_loss_accross_layers = mse_loss_tensor.sum(dim=-1).mean(dim=0)
         mse_loss = mse_loss_accross_layers.sum()
         
-        if self.cfg.cross_layer_decoders:
-            squared_norms = (self.W_dec.float()**2).sum(dim=2)
-            feature_norms_local = torch.sqrt(torch.matmul(self.layer_mask.float(), squared_norms)) 
-        else: 
-            feature_norms_local = self.W_dec.float().norm(dim=2)
-        
-        # Compute L0 loss local
-        weighted_activations = feat_act.float() * feature_norms_local
-        tanh_weighted_activations = torch.tanh(C_l0_COEF * weighted_activations)
-        l0_loss_accross_layers = l0_coef * tanh_weighted_activations.sum(dim=-1).mean(dim=0)
-        l0_loss = l0_loss_accross_layers.sum().float()
-        
-        # SUM losses across ranks using autograd-aware all_reduce
-        if self.cfg.is_sharded:
-            l0_loss = all_reduce(l0_loss, op=dist.ReduceOp.SUM)
-            # l0_loss /= self.world_size
-            l0_loss_accross_layers = all_reduce(l0_loss_accross_layers, op=dist.ReduceOp.SUM)
-            # l0_loss_accross_layers /= self.world_size
+        if self.cfg.activation_fn in ["topk", "groupmax"]:
+            l0_loss = torch.tensor(0.0, device=act_in.device, dtype=torch.float32)
+            l0_loss_accross_layers = torch.zeros(self.N_layers, device=act_in.device, dtype=torch.float32)
+            dead_feature_loss = torch.tensor(0.0, device=act_in.device, dtype=torch.float32)
+        else:
+            if self.cfg.cross_layer_decoders:
+                squared_norms = (self.W_dec.float()**2).sum(dim=2)
+                feature_norms_local = torch.sqrt(torch.matmul(self.layer_mask.float(), squared_norms)) 
+            else: 
+                feature_norms_local = self.W_dec.float().norm(dim=2)
+            
+            # Compute L0 loss local
+            weighted_activations = feat_act.float() * feature_norms_local
+            tanh_weighted_activations = torch.tanh(C_l0_COEF * weighted_activations)
+            l0_loss_accross_layers = l0_coef * tanh_weighted_activations.sum(dim=-1).mean(dim=0)
+            l0_loss = l0_loss_accross_layers.sum().float()
+            
+            # SUM losses across ranks using autograd-aware all_reduce
+            if self.cfg.is_sharded:
+                l0_loss = all_reduce(l0_loss, op=dist.ReduceOp.SUM)
+                # l0_loss /= self.world_size
+                l0_loss_accross_layers = all_reduce(l0_loss_accross_layers, op=dist.ReduceOp.SUM)
+                # l0_loss_accross_layers /= self.world_size
 
-        if self.cfg.debug: 
-            self.log_loss_debug(feat_act, feature_norms_local, l0_loss)
-                
-        ### Dead feature penalty 
-        dead_feature_loss = df_coef * torch.relu(torch.exp(self.log_threshold.float()) - hidden_pre.float()) * feature_norms_local
-        dead_feature_loss = dead_feature_loss.sum(dim=-1).mean(dim=0).sum()
+            if self.cfg.debug: 
+                self.log_loss_debug(feat_act, feature_norms_local, l0_loss)
+                    
+            ### Dead feature penalty 
+            dead_feature_loss = df_coef * torch.relu(torch.exp(self.log_threshold.float()) - hidden_pre.float()) * feature_norms_local
+            dead_feature_loss = dead_feature_loss.sum(dim=-1).mean(dim=0).sum()
 
-        # SUM losses across ranks using autograd-aware all_reduce
-        if self.cfg.is_sharded:
-            dead_feature_loss = all_reduce(dead_feature_loss, op=dist.ReduceOp.SUM)
-            # dead_feature_loss /= self.world_size
+            # SUM losses across ranks using autograd-aware all_reduce
+            if self.cfg.is_sharded:
+                dead_feature_loss = all_reduce(dead_feature_loss, op=dist.ReduceOp.SUM)
+                # dead_feature_loss /= self.world_size
 
         ### Dead feature count local
         with torch.no_grad():

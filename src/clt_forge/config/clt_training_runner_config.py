@@ -38,6 +38,8 @@ class CLTTrainingRunnerConfig(BaseModel):
     jumprelu_init_threshold: float = 0.03
     jumprelu_bandwidth: float = 1.
     normalize_decoder: bool = False
+    activation_fn: str = "jumprelu"
+    k: Optional[int] = None
     
     # -----ActivationStore Parameters---------
     context_size: int = 32

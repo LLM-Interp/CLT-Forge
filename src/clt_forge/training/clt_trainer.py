@@ -74,7 +74,7 @@ class CLTTrainer():
         print(f"warm up {cfg.l0_warm_up_steps}")
 
         self.optimizer = Adam(
-            self.clt.parameters(),
+            [p for p in self.clt.parameters() if p.requires_grad],
             lr=cfg.lr,
             betas=(
                 cfg.adam_beta1,
@@ -101,7 +101,6 @@ class CLTTrainer():
         self.accumulation_step: int = 0
 
     def _initialize_b_enc(self, n_batches: int = 5):
-
         model = self._get_clt()
 
         def get_hidden_pre(acts_in):

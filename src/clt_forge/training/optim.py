@@ -1,6 +1,7 @@
 import math
 import torch 
-from typing import Any
+import torch.nn.functional as F
+from typing import Any, Literal
 
 class LearningRateScheduler:
     def __init__(
@@ -135,3 +136,112 @@ class JumpReLU(torch.autograd.Function):
             dim=0,
         )
         return x_grad, threshold_grad, None
+
+
+class FusedEncoder(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx, input, weight, bias, k: int, activation: Literal["groupmax", "topk"]
+    ):
+        """
+        input:  (B, L, D)
+        weight: (L, D, M)
+        bias:   (L, M)
+        k:      int (number of top elements to select along dim=-1)
+        """
+        preacts = torch.einsum("bld,ldm->blm", input, weight)
+        if bias is not None:
+            preacts = preacts + bias.unsqueeze(0)
+        preacts = F.relu(preacts)
+
+        # Get top-k values and indices for each row
+        if activation == "topk":
+            values, indices = torch.topk(preacts, k, dim=-1, sorted=False)
+        elif activation == "groupmax":
+            values, indices = preacts.unflatten(-1, (k, -1)).max(dim=-1)
+
+            # torch.max gives us indices into each group, but we want indices into the
+            # flattened tensor. Add the offsets to get the correct indices.
+            num_latents = preacts.shape[-1]
+            offsets = torch.arange(
+                0, num_latents, num_latents // k, device=preacts.device
+            )
+            indices = offsets + indices
+        else:
+            raise ValueError(f"Unknown activation: {activation}")
+
+        ctx.save_for_backward(input, weight, bias, indices)
+        ctx.k = k
+        ctx.activation = activation
+        return values, indices, preacts
+
+    @staticmethod
+    def backward(ctx, grad_values, grad_indices, grad_preacts):
+        input, weight, bias, indices = ctx.saved_tensors
+        
+        B, L, D = input.shape
+        _, _, M = weight.shape
+        
+        grad_input = grad_weight = grad_bias = None
+
+        # --- Grad w.r.t. input ---
+        if ctx.needs_input_grad[0]:
+            grad_input = torch.zeros_like(input)
+            for l in range(L):
+                embedding_weight = weight[l].T  # Shape: (M, D)
+                grad_input[:, l, :] = F.embedding_bag(
+                    indices[:, l, :],
+                    embedding_weight,
+                    mode="sum",
+                    per_sample_weights=grad_values[:, l, :].type_as(embedding_weight),
+                )
+
+        # --- Grad w.r.t. weight ---
+        if ctx.needs_input_grad[1]:
+            grad_weight = torch.zeros_like(weight)
+            for l in range(L):
+                # Compute contributions from each top-k element for layer l
+                contributions_l = grad_values[:, l, :].unsqueeze(2) * input[:, l, :].unsqueeze(1) # Shape: (B, k, D)
+                contributions_l = contributions_l.reshape(-1, D) # Shape: (B*k, D)
+                
+                grad_weight_l_T = torch.zeros(M, D, device=weight.device, dtype=weight.dtype)
+                grad_weight_l_T.index_add_(0, indices[:, l, :].flatten(), contributions_l.type_as(weight))
+                grad_weight[l] = grad_weight_l_T.T
+
+        # --- Grad w.r.t. bias ---
+        if bias is not None and ctx.needs_input_grad[2]:
+            grad_bias = torch.zeros_like(bias)
+            for l in range(L):
+                grad_bias[l].index_add_(
+                    0, indices[:, l, :].flatten(), grad_values[:, l, :].flatten().type_as(bias)
+                )
+
+        return grad_input, grad_weight, grad_bias, None, None
+
+
+def fused_encoder(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    k: int,
+    activation: Literal["groupmax", "topk"],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Convenience wrapper that performs a multi-layer projection followed by `activation`
+    with a backward pass optimized using index_add and embedding_bag.
+    """
+    is_2d = (input.dim() == 2)
+    if is_2d:
+        input = input.unsqueeze(1)    # (B, 1, D)
+        weight = weight.unsqueeze(0)  # (1, D, M)
+        if bias is not None:
+            bias = bias.unsqueeze(0)  # (1, M)
+            
+    values, indices, preacts = FusedEncoder.apply(input, weight, bias, k, activation)
+    
+    if is_2d:
+        values = values.squeeze(1)
+        indices = indices.squeeze(1)
+        preacts = preacts.squeeze(1)
+        
+    return values, indices, preacts
