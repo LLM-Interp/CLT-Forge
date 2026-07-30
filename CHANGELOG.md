@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
 * Training pipeline with configurable runners
 * Feature sharding, ddp, sfdp implemented
 * Compression implemented in activation store (not yet tested properly on downstream effects)
+* Support raw text datasets in `ActivationsStore` via lazy tokenization.
 
 ### Notes
 

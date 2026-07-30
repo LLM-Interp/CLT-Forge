@@ -94,21 +94,7 @@ class ActivationsStore:
                 self.raw_ds = load_dataset_auto(cfg.dataset_path, split=cfg.split, disk=cfg.disk)
             logger.info("Loaded dataset")
         
-            if "tokens" not in self.raw_ds.column_names:
-                if "input_ids" in self.raw_ds.column_names:
-                    logger.info("tokens column not found — using input_ids instead.")
-                    self.raw_ds = self.raw_ds.rename_column("input_ids", "tokens")
-                else:
-                    raise ValueError(
-                        f"Dataset {cfg.dataset_path} must contain a pre-tokenised tokens or input_ids column."
-                    )
-                
-            first_tok = self.raw_ds[0]["tokens"]
-
-            if isinstance(first_tok, torch.Tensor) and first_tok.ndim != 1:
-                raise ValueError("Each 'tokens' entry must be a 1‑D tensor.")
-            if isinstance(first_tok, (list, tuple)) and any(isinstance(x, list) for x in first_tok):
-                raise ValueError("Nested sequences detected; expected a flat list of ints.")
+            self._validate_dataset_columns()
 
             self._reset_token_iterator()
         else: 
@@ -148,6 +134,96 @@ class ActivationsStore:
         assert self.cfg.train_batch_size_tokens % self.cfg.context_size == 0, "ctx size must divide train_batch_size_tokens"
     # ───────────────────  token pipeline  ───────────────────
 
+    def _validate_dataset_columns(self) -> None:
+        if self.cfg.is_dataset_tokenized:
+            if "tokens" not in self.raw_ds.column_names:
+                if "input_ids" in self.raw_ds.column_names:
+                    logger.info("tokens column not found — using input_ids instead.")
+                    self.raw_ds = self.raw_ds.rename_column("input_ids", "tokens")
+                else:
+                    raise ValueError(
+                        f"Dataset {self.cfg.dataset_path} must contain a pre-tokenised tokens or input_ids column "
+                        "when is_dataset_tokenized=True."
+                    )
+
+            self._tokens_from_dataset_row(self.raw_ds[0])
+            return
+
+        if self.cfg.dataset_text_column not in self.raw_ds.column_names:
+            raise ValueError(
+                f"Dataset {self.cfg.dataset_path} must contain dataset_text_column="
+                f"'{self.cfg.dataset_text_column}' when is_dataset_tokenized=False."
+            )
+
+        if getattr(self.model, "tokenizer", None) is None:
+            raise ValueError("Raw text datasets require model.tokenizer to tokenize examples.")
+
+        first_text = self.raw_ds[0][self.cfg.dataset_text_column]
+        if not isinstance(first_text, str):
+            raise ValueError(
+                f"Expected dataset_text_column='{self.cfg.dataset_text_column}' to contain strings, "
+                f"got {type(first_text).__name__}."
+            )
+
+    def _tokens_from_dataset_row(self, row: Any) -> torch.Tensor:
+        if self.cfg.is_dataset_tokenized:
+            toks = row["tokens"]
+        else:
+            toks = self._tokenize_raw_text(row[self.cfg.dataset_text_column])
+
+        toks = self._ensure_1d_token_tensor(toks)
+        return self._strip_leading_bos(toks)
+
+    def _tokenize_raw_text(self, text: str) -> Any:
+        if not isinstance(text, str):
+            raise ValueError(
+                f"Expected dataset_text_column='{self.cfg.dataset_text_column}' to contain strings, "
+                f"got {type(text).__name__}."
+            )
+
+        tokenizer = getattr(self.model, "tokenizer", None)
+        if tokenizer is None:
+            raise ValueError("Raw text datasets require model.tokenizer to tokenize examples.")
+
+        try:
+            encoded = tokenizer(text, add_special_tokens=False)
+            if isinstance(encoded, dict):
+                return encoded["input_ids"]
+            if isinstance(encoded, (list, tuple, torch.Tensor)):
+                return encoded
+            if hasattr(encoded, "input_ids"):
+                return encoded.input_ids
+        except TypeError:
+            return tokenizer.encode(text, add_special_tokens=False)
+
+        raise ValueError("Tokenizer output must contain input_ids.")
+
+    def _ensure_1d_token_tensor(self, toks: Any) -> torch.Tensor:
+        if isinstance(toks, torch.Tensor):
+            toks = toks.detach().cpu().to(dtype=torch.long)
+        else:
+            toks = torch.as_tensor(toks, dtype=torch.long)
+
+        if toks.ndim != 1:
+            raise ValueError("Each token entry must be a 1-D sequence of token ids.")
+
+        return toks
+
+    def _strip_leading_bos(self, toks: torch.Tensor) -> torch.Tensor:
+        tokenizer = getattr(self.model, "tokenizer", None)
+        bos_id = None if tokenizer is None else getattr(tokenizer, "bos_token_id", None)
+
+        if bos_id is not None and len(toks) > 0 and toks[0].item() == bos_id:
+            return toks[1:]
+
+        return toks
+
+    def _truncate_to_context(self, toks: torch.Tensor) -> torch.Tensor:
+        truncated_len = (len(toks) // self.context_size) * self.context_size
+        if truncated_len == 0:
+            return toks
+        return toks[:truncated_len]
+
     def _iterate_raw_dataset_tokens(self) -> Iterator[torch.Tensor]:
         """
         Yield each row's token vector as a 1‑D torch.Tensor on **CPU**.
@@ -163,24 +239,13 @@ class ActivationsStore:
         self.runtime_doc_languages = []
 
         for i in range(start, end):
-            toks = self.raw_ds[i]["tokens"]
-            tokenizer = getattr(self.model, "tokenizer", None)
-            bos_id = None if tokenizer is None else tokenizer.bos_token_id
+            toks = self._tokens_from_dataset_row(self.raw_ds[i])
+            toks = self._truncate_to_context(toks)
 
-            if not isinstance(toks, torch.Tensor):
-                toks = torch.tensor(toks, dtype=torch.long)
-            
-            if bos_id is not None and len(toks) > 0 and toks[0].item() == bos_id:
-                toks = toks[1:]
-            
-            doc_len = len(toks)
-            truncated_len = (doc_len // (self.context_size)) * (self.context_size) # TODO before -1 to both
-
-            if truncated_len > 0:
-                toks = toks[:truncated_len]
+            if len(toks) > 0:
 
                 if self.cfg.is_multilingual_split_dataset: 
-                    n_sequences = truncated_len // (self.context_size)
+                    n_sequences = len(toks) // self.context_size
                     for _ in range(n_sequences):
                         self.runtime_doc_languages.append(self.doc_languages[i])
 
@@ -493,7 +558,10 @@ class ActivationsStore:
 
         # Infer full token count if not provided
         if number_of_tokens is None:
-            number_of_tokens = sum(len(example["tokens"]) for example in self.raw_ds)
+            number_of_tokens = sum(
+                len(self._truncate_to_context(self._tokens_from_dataset_row(example)))
+                for example in self.raw_ds
+            )
             number_of_tokens -= number_of_tokens % buffer_size  # truncate to full buffers
             logger.info(f"[ActivationsStore] Using full dataset: {number_of_tokens} tokens")
 
