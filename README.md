@@ -129,7 +129,7 @@ This library currently implements L1-regularized [JumpReLU](https://arxiv.org/pd
   - Similar in spirit (but simpler) to [Neuronpedia](https://github.com/hijohnnylin/neuronpedia)
   - Soon including attention-attribution support (as in [SparseAttention](https://arxiv.org/abs/2512.05865))
 
-We welcome contributions to the library. Please refer to [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and templates. If you are interested in collaboration, you can also request access to the following [document](https://docs.google.com/document/d/1-qi6uROKHPxac0zID1EcSASDpi4Q2RIa-nDFiXJq2bw/edit?usp=sharing) with cool CLT improvement ideas. Finally, if you have any questions or want to discuss potential improvements/collaboration, write to us on the [librabry discord](https://discord.gg/XJCkjrHE) !
+We welcome contributions to the library. Please refer to [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines and templates. If you are interested in collaboration, you can also request access to the following [document](https://docs.google.com/document/d/1-qi6uROKHPxac0zID1EcSASDpi4Q2RIa-nDFiXJq2bw/edit?usp=sharing) with cool CLT improvement ideas. Finally, if you have any questions or want to discuss potential improvements/collaboration, write to us on the [library discord](https://discord.gg/rkwNMCAr3N) !
 
 ------------------------------------------------------------------------
 
@@ -153,7 +153,7 @@ If you found CLT-Forge useful for your research, please cite our paper:
 ```bibtex
 @article{draye2026clt,
   title={{CLT}-{F}orge: {A} Scalable Library for Cross-Layer Transcoders and Attribution Graphs}, 
-  author={Florent Draye and Abir Harrasse and Vedant Palit and Tung-Yu Wu and Jiarui Liu and Punya Syon Pandey and Roderick Wu and Terry Jingchen Zhang and Zhijing Jin and Bernhard Sch{\"{o}}lkopf},
+  author={Florent Draye and Vedant Palit and Abir Harrasse and Tung-Yu Wu and Jiarui Liu and Punya Syon Pandey and Roderick Wu and Chih-Hao Hsu and Terry Jingchen Zhang and Zhijing Jin and Bernhard Sch{\"{o}}lkopf},
   journal      = {CoRR},
   volume       = {abs/2603.21014},
   year         = {2026},
