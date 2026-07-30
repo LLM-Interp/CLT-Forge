@@ -99,6 +99,28 @@ graph = runner.run(
 )
 ```
 
+You can also run attribution with an open-source circuit-tracer CLT instead of
+a CLT-Forge checkpoint:
+
+``` python
+from clt_forge.attribution.attribution import AttributionRunner
+
+runner = AttributionRunner.from_circuit_tracer_hub(
+  hf_ref = "mntss/clt-gemma-2-2b-426k",
+  model_name = "google/gemma-2-2b",
+)
+
+graph = runner.run(
+  input_string = "The capital of France is",
+  folder_name = "where/to/save",
+  run_interventions = False,
+)
+```
+
+See `notebooks/load_open_source_circuit_tracer_clt.ipynb` for an end-to-end
+example that saves a CLT-Forge-compatible graph and opens the existing visual
+interface.
+
 ------------------------------------------------------------------------
 
 ### 5. Start the Visual-Interface

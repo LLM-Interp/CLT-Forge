@@ -3,7 +3,8 @@ from clt_forge import logger
 import torch
 from typing import List, Dict, Any, Tuple
 
-from clt_forge.vendor.circuit_tracer.circuit_tracer import ReplacementModel
+import clt_forge.vendor.circuit_tracer  # noqa: F401
+from circuit_tracer import ReplacementModel
 
 def _decode_top_tokens(model, probs, top_k: int):
     top_tokens = torch.topk(probs, top_k)
