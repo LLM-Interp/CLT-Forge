@@ -24,6 +24,8 @@ class CLTConfig(BaseModel):
     cross_layer_decoders: bool
     context_size: int
     functional_loss: Optional[str] = None
+    activation_fn: str = "jumprelu"
+    k: Optional[int] = None
 
     # -----Sparsity---------------------------
     l0_coefficient: float

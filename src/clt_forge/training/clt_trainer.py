@@ -30,6 +30,7 @@ class CLTTrainer():
         activations_store: ActivationsStore,
         cfg: CLTTrainingRunnerConfig,
         save_checkpoint_fn: Callable[["CLTTrainer", str], None],
+        val_activations_store: Optional[ActivationsStore] = None,
         rank: int = 0,
         world_size: int = 1
     ) -> None:
@@ -38,9 +39,13 @@ class CLTTrainer():
         self.is_main_process = rank == 0
         self.clt = clt
         self.activations_store = activations_store
+        self.val_activations_store = val_activations_store
         self.cfg = cfg
         self.save_checkpoint_fn = save_checkpoint_fn
         self.n_training_steps: int = 0
+        
+        # Evaluator instantiated dynamically to save memory if not evaluating
+        self.evaluator = None
 
         self.checkpoint_thresholds = []
         if self.cfg.n_checkpoints > 0:
@@ -74,7 +79,7 @@ class CLTTrainer():
         print(f"warm up {cfg.l0_warm_up_steps}")
 
         self.optimizer = Adam(
-            self.clt.parameters(),
+            [p for p in self.clt.parameters() if p.requires_grad],
             lr=cfg.lr,
             betas=(
                 cfg.adam_beta1,
@@ -101,7 +106,6 @@ class CLTTrainer():
         self.accumulation_step: int = 0
 
     def _initialize_b_enc(self, n_batches: int = 5):
-
         model = self._get_clt()
 
         def get_hidden_pre(acts_in):
@@ -195,6 +199,14 @@ class CLTTrainer():
             if self.accumulation_step == 0: 
                 self._log_train_step(loss_metrics)
                 self._checkpoint_if_needed()
+                
+                # Check for evaluation
+                if self.is_main_process and self.cfg.eval_step_size is not None and self.n_training_steps > 0 and self.n_training_steps % self.cfg.eval_step_size == 0:
+                    self._evaluate_and_log_metrics(prefix="train")
+                
+                # Check for validation
+                if self.is_main_process and self.cfg.val_step_size is not None and self.n_training_steps > 0 and self.n_training_steps % self.cfg.val_step_size == 0:
+                    self._evaluate_and_log_metrics(prefix="val")
 
             # if self.cfg.functional_loss is not None and self.fc_scheduler.get_lr() > 0 and start_func_finetuning:
             #     self._enable_functional_training()
@@ -221,6 +233,9 @@ class CLTTrainer():
             
             if self.accumulation_step == 0:
                 self.n_training_steps += 1
+
+        if self.is_main_process and self.cfg.eval_step_size is not None:
+            self._evaluate_and_log_metrics(prefix="train")
 
         self.save_checkpoint_fn(
             trainer=self,
@@ -603,6 +618,81 @@ class CLTTrainer():
             )
 
         return log_dict
+
+    def _evaluate_and_log_metrics(self, prefix: str = "train"):
+        """Evaluates metrics via CLTEvaluator and logs to W&B."""
+        if not self.cfg.log_to_wandb:
+            return
+
+        import numpy as np
+
+        if self.evaluator is None:
+            from clt_forge.training.eval_metrics import CLTEvaluator
+            self.evaluator = CLTEvaluator(self._get_clt(), self.cfg)
+
+        store = self.val_activations_store if prefix == "val" and self.val_activations_store else self.activations_store
+        
+        # Get a batch of tokens
+        # The activations store __iter__ yields: `*tokens, acts_in, acts_out`
+        try:
+            batch = next(store.__iter__())
+            tokens = batch[0] if len(batch) > 2 else None
+        except StopIteration:
+            logger.warning(f"Failed to get evaluation batch for {prefix}.")
+            return
+
+        if tokens is None:
+            logger.warning(f"No tokens available in ActivationsStore for evaluation.")
+            return
+
+        logger.info(f"Running evaluation ({prefix}) at step {self.n_training_steps}...")
+
+        # Evaluate Replacement Score and KL Divergence
+        metrics_kl = self.evaluator.evaluate_replacement_and_kl(tokens)
+
+        # Evaluate Pruning-time Sparsity Sweeps
+        tau_values = np.linspace(0, 1.0, self.cfg.tau_sweep_steps)
+        pruning_table = wandb.Table(columns=["tau", "pruned_l0_norm"])
+        
+        base_sparsity_metrics = None
+        for tau in tau_values:
+            sparsity_metrics = self.evaluator.evaluate_sparsity_and_l0(tokens, tau=tau)
+            pruning_table.add_data(tau, sparsity_metrics["pruned_l0_norm"])
+            if tau == 0.0:
+                base_sparsity_metrics = sparsity_metrics
+
+        # Evaluate Activation Density
+        density_metrics = self.evaluator.evaluate_activation_density(tokens)
+
+        # Log basic metrics
+        log_dict = {
+            f"{prefix}_eval/replacement_score": metrics_kl["replacement_score"],
+            f"{prefix}_eval/kl_divergence": metrics_kl["kl_divergence"],
+            f"{prefix}_eval/l0_norm": base_sparsity_metrics["l0_norm"],
+            f"{prefix}_eval/mean_activation_density": density_metrics["mean_activation_density"],
+            f"{prefix}_eval/dead_features_ratio": density_metrics["dead_features_ratio"],
+        }
+
+        # 1. Pareto Frontier
+        pareto_table = wandb.Table(columns=["l0_norm", "replacement_score", "step"])
+        pareto_table.add_data(base_sparsity_metrics["l0_norm"], metrics_kl["replacement_score"], self.n_training_steps)
+        log_dict[f"{prefix}_eval/Pareto_Frontier"] = wandb.plot.scatter(pareto_table, "l0_norm", "replacement_score", title=f"Pareto Frontier ({prefix})")
+
+        # 3. Pruning Sweep
+        log_dict[f"{prefix}_eval/Pruning_Sweep"] = wandb.plot.line(pruning_table, "tau", "pruned_l0_norm", title=f"Pruning-time Sparsity Sweep ({prefix})")
+
+        # 4. Dead Feature Histogram
+        density_vector = density_metrics["activation_density_per_feature"].flatten().cpu().numpy().tolist()
+        log_dict[f"{prefix}_eval/Activation_Density_Hist"] = wandb.Histogram(density_vector)
+
+        # 5. Per-Layer Density Table for W&B Native Custom Charts
+        layer_density_table = wandb.Table(columns=["Layer", "Step", "Mean_Density"])
+        density_per_layer = density_metrics["activation_density_per_feature"].mean(dim=1).cpu().numpy()
+        for l_idx, density in enumerate(density_per_layer):
+            layer_density_table.add_data(l_idx, self.n_training_steps, float(density))
+        log_dict[f"{prefix}_eval/Layer_Density_Table"] = layer_density_table
+
+        wandb.log(log_dict)
 
     # def _enable_functional_training(self):
     #     """Enable functional training by configuring activations store for token return."""

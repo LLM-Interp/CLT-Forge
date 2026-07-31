@@ -164,6 +164,7 @@ class CLTTrainingRunner:
         trainer = CLTTrainer(
             clt=self.clt,
             activations_store=self.activations_store,
+            val_activations_store=getattr(self, "val_activations_store", None),
             save_checkpoint_fn=self.save_checkpoint,
             cfg=self.cfg,
             rank=self.rank, 
