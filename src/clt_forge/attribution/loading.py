@@ -9,6 +9,9 @@ def load_circuit_tracing_clt_from_local(
     clt_checkpoint: str,
     device: str = "cuda",
     debug: bool = False,
+    is_sharded: bool = False,
+    rank: int | None = None,
+    world_size: int | None = None,
 ) -> CrossLayerTranscoder:
     """
     Creates a Circuit Tracing CLT from a local CLT checkpoint.
@@ -21,7 +24,16 @@ def load_circuit_tracing_clt_from_local(
     path = Path(clt_checkpoint)
     log(f"Loading CLT checkpoint from: {clt_checkpoint}")
 
-    clt = CLT.load_from_pretrained(path, device=device)
+    if is_sharded:
+        clt = CLT._load_from_pretrained(
+            path,
+            device=device,
+            is_sharded=True,
+            rank=rank,
+            world_size=world_size,
+        )
+    else:
+        clt = CLT.load_from_pretrained(path, device=device)
 
     state_dict_local = {
         k: v for k, v in clt.state_dict().items()

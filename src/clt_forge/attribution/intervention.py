@@ -34,25 +34,27 @@ def run_intervention(
         for pos, layer, feature_idx, value in features
     ]
 
-    input_tokens = model.ensure_tokenized(input_string)
+    # Unwrap DDP/FSDP to access tokenizer and feature_intervention
+    unwrapped_model = model.module if hasattr(model, "module") else model
+    input_tokens = unwrapped_model.ensure_tokenized(input_string)
 
-    intervened_logits, _ = model.feature_intervention(
+    intervened_logits, _ = unwrapped_model.feature_intervention(
         input_tokens,
         interventions=features_to_intervene,
         freeze_attention=freeze_attention,
     )
 
-    original_logits = model(input_tokens)
+    original_logits = unwrapped_model(input_tokens)
 
     original_probs = torch.softmax(original_logits[0, -1], dim=-1)
     intervened_probs = torch.softmax(intervened_logits[0, -1], dim=-1)
 
     top_tokens, top_token_strings = _decode_top_tokens(
-        model, intervened_probs, top_tokens_count
+        unwrapped_model, intervened_probs, top_tokens_count
     )
 
     baseline_top_tokens, baseline_token_strings = _decode_top_tokens(
-        model, original_probs, top_tokens_count
+        unwrapped_model, original_probs, top_tokens_count
     )
 
     baseline_probs = []
@@ -86,14 +88,25 @@ def run_intervention_per_feature(  # useful for the visual interface
     debug: bool = False,
 ) -> List[Dict[str, Any]]:
     """
-    Applies independent interventions for each feature and returns the top predicted tokens
+    Applies independent interventions for each feature and returns the top predicted tokens.
+
+    In a distributed setting (DDP/FSDP), active features are sharded across ranks so that
+    each rank computes interventions for its own subset in parallel. Results are gathered
+    via dist.all_gather_object and reconstructed in original feature order on all ranks.
     """
+    import torch.distributed as dist
+
+    is_dist = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if is_dist else 0
+    world_size = dist.get_world_size() if is_dist else 1
 
     def log(msg):
-        if debug:
+        if debug and rank == 0:
             logger.info(msg)
 
-    input_tokens = model.ensure_tokenized(input_string)
+    # Unwrap DDP/FSDP to access tokenizer and inference helpers
+    unwrapped_model = model.module if hasattr(model, "module") else model
+    input_tokens = unwrapped_model.ensure_tokenized(input_string)
     data = result
 
     feature_indices = data["feature_indices"]
@@ -110,9 +123,17 @@ def run_intervention_per_feature(  # useful for the visual interface
 
     log(f"Intervening on {len(active_feature_indices)} features")
 
-    results: List[Dict[str, Any]] = []
+    # ── Distributed sharding ─────────────────────────────────────────────────
+    # Each rank handles a strided slice of the active features:
+    #   rank 0 -> indices 0, world_size, 2*world_size, ...
+    #   rank 1 -> indices 1, world_size+1, 2*world_size+1, ...
+    local_indices = list(range(rank, len(active_feature_indices), world_size))
+    local_feature_data = active_feature_indices[local_indices]
 
-    for feature_data in active_feature_indices:
+    local_results_with_idx: List[tuple] = []   # (original_idx, result_dict)
+
+    for local_i, feature_data in enumerate(local_feature_data):
+        original_idx = local_indices[local_i]
         layer = int(feature_data[1])
         pos = int(feature_data[0])
         feature_idx = int(feature_data[2])
@@ -130,7 +151,7 @@ def run_intervention_per_feature(  # useful for the visual interface
             features_to_intervene = [(layer, pos, feature_idx, value)]
 
             try:
-                intervened_logits, _ = model.feature_intervention(
+                intervened_logits, _ = unwrapped_model.feature_intervention(
                     input_tokens,
                     interventions=features_to_intervene,
                     freeze_attention=freeze_attention,
@@ -141,7 +162,7 @@ def run_intervention_per_feature(  # useful for the visual interface
                 )
 
                 top_tokens, token_strings = _decode_top_tokens(
-                    model, intervened_probs, top_tokens_count
+                    unwrapped_model, intervened_probs, top_tokens_count
                 )
 
                 new_prob = intervened_probs[baseline_top_idx].item()
@@ -177,6 +198,19 @@ def run_intervention_per_feature(  # useful for the visual interface
                     }
                 )
 
-        results.append(feature_result)
+        local_results_with_idx.append((original_idx, feature_result))
+
+    # ── Gather across ranks and reconstruct ordering ──────────────────────────
+    if is_dist:
+        # all_gather_object works on Python objects, no tensor requirement
+        gathered: List[List[tuple]] = [None] * world_size  # type: ignore[list-item]
+        dist.all_gather_object(gathered, local_results_with_idx)
+
+        # Flatten and sort by original feature index
+        all_pairs: List[tuple] = [pair for rank_list in gathered for pair in rank_list]
+        all_pairs.sort(key=lambda x: x[0])
+        results = [feat_res for _, feat_res in all_pairs]
+    else:
+        results = [feat_res for _, feat_res in local_results_with_idx]
 
     return results
